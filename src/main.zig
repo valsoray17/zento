@@ -59,6 +59,137 @@ fn calculate(input: []const u8) ?f64 {
 }
 
 // ============================================================================
+// Unit Conversion
+// ============================================================================
+
+// Temperature units — simple enum with just two values
+//
+// In Go, you'd write:
+//   type TempUnit int
+//   const (
+//       Celsius TempUnit = iota
+//       Fahrenheit
+//   )
+//   func (u TempUnit) String() string { ... }
+//
+// Zig allows methods directly inside enums — cleaner!
+const TempUnit = enum {
+    celsius,
+    fahrenheit,
+
+    // Parse string suffix to temperature unit (case-insensitive)
+    // `self` is implicit for methods — like Go receivers but cleaner syntax
+    // Returns optional: null if no match
+    fn fromStr(s: []const u8) ?TempUnit {
+        if (s.len == 0) return null;
+        // Switch on first character — case insensitive
+        return switch (s[0]) {
+            'C', 'c' => .celsius,
+            'F', 'f' => .fahrenheit,
+            else => null,
+        };
+    }
+
+    // Get display string for the unit
+    // Note: `self` comes first, like Go's (u TempUnit) receiver
+    fn toStr(self: TempUnit) []const u8 {
+        return switch (self) {
+            .celsius => "C",
+            .fahrenheit => "F",
+        };
+    }
+};
+
+// Find conversion separator (" to " or " in ") in input
+// Returns position and length of separator, or null if not found
+fn findSeparator(input: []const u8) ?struct { pos: usize, len: usize } {
+    // Try " to " first (4 chars)
+    if (std.mem.indexOf(u8, input, " to ")) |pos| {
+        return .{ .pos = pos, .len = 4 };
+    }
+    // Try " in " (4 chars)
+    if (std.mem.indexOf(u8, input, " in ")) |pos| {
+        return .{ .pos = pos, .len = 4 };
+    }
+    return null;
+}
+
+// Parse number prefix from input, return value and remaining string
+//
+// "32F to C"   → { value: 32, rest: "F to C" }
+// "100 MB to KB" → { value: 100, rest: "MB to KB" }
+// "hello"      → null (not a conversion)
+//
+// This is the shared first step for all unit conversions.
+fn parseNumberPrefix(input: []const u8) ?struct { value: f64, rest: []const u8 } {
+    const trimmed = std.mem.trim(u8, input, " ");
+    if (trimmed.len == 0) return null;
+
+    // Find where the number ends (digits, dot, minus)
+    var num_end: usize = 0;
+    for (trimmed, 0..) |c, i| {
+        if ((c >= '0' and c <= '9') or c == '.' or c == '-') {
+            num_end = i + 1;
+        } else break;
+    }
+
+    if (num_end == 0) return null; // No number found
+
+    const num_str = trimmed[0..num_end];
+    const rest = std.mem.trim(u8, trimmed[num_end..], " ");
+
+    const value = std.fmt.parseFloat(f64, num_str) catch return null;
+
+    return .{ .value = value, .rest = rest };
+}
+
+// Convert temperature: "F to C" with value 32 → "0.00 C"
+//
+// Takes pre-parsed value and the rest of input (e.g., "F to C").
+// Buffer is for writing result — Zig avoids hidden allocations.
+fn convertTemperature(value: f64, rest: []const u8, buf: []u8) ?[]const u8 {
+    // Find separator (" to " or " in ")
+    const sep = findSeparator(rest) orelse return null;
+
+    // Split: "F to C" → "F" and "C"
+    const from_str = std.mem.trim(u8, rest[0..sep.pos], " ");
+    const to_str = std.mem.trim(u8, rest[sep.pos + sep.len ..], " ");
+
+    // Parse units — if either fails, this isn't a temperature conversion
+    const from_unit = TempUnit.fromStr(from_str) orelse return null;
+    const to_unit = TempUnit.fromStr(to_str) orelse return null;
+
+    // Convert using direct formula (Option A — just F and C)
+    const result: f64 = switch (from_unit) {
+        .celsius => switch (to_unit) {
+            .celsius => value,
+            .fahrenheit => value * 9.0 / 5.0 + 32.0,
+        },
+        .fahrenheit => switch (to_unit) {
+            .celsius => (value - 32.0) * 5.0 / 9.0,
+            .fahrenheit => value,
+        },
+    };
+
+    // Format result into buffer
+    const formatted = std.fmt.bufPrint(buf, "{d:.2} {s}", .{ result, to_unit.toStr() }) catch return null;
+    return formatted;
+}
+
+// Main conversion dispatcher — tries all conversion types
+fn convert(input: []const u8, buf: []u8) ?[]const u8 {
+    // Step 1: Parse number prefix (shared for all conversions)
+    const parsed = parseNumberPrefix(input) orelse return null;
+
+    // Step 2: Try each converter until one succeeds
+    if (convertTemperature(parsed.value, parsed.rest, buf)) |result| return result;
+    // Later: if (convertDataUnit(parsed.value, parsed.rest, buf)) |result| return result;
+    // Later: if (calculateBandwidth(parsed.value, parsed.rest, buf)) |result| return result;
+
+    return null;
+}
+
+// ============================================================================
 // Main
 // ============================================================================
 
@@ -119,7 +250,14 @@ pub fn main() !void {
             continue;
         }
 
-        // Not a calculation — echo for now (will add more commands later)
+        // Try unit conversion
+        var convert_buf: [256]u8 = undefined;
+        if (convert(trimmed, &convert_buf)) |result| {
+            try stdout.print("= {s}\n", .{result});
+            continue;
+        }
+
+        // Not a calculation or conversion — echo for now
         try stdout.print("Unknown command: {s}\n", .{trimmed});
     }
 }
