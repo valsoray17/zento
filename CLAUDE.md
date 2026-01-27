@@ -9,6 +9,7 @@ Background: Coming from Go.
 - Calculator plugin: supports +, -, *, /, % operations
 - Quit command
 - Temperature conversion: F ↔ C (e.g., `32F to C`, `100C in F`)
+- Data unit conversion: B, KB, MB, GB, TB (e.g., `100 MB to KB`)
 
 ## Next Steps
 - [ ] Application Launcher
@@ -18,7 +19,7 @@ Background: Coming from Go.
 - [ ] Remember frequently launched apps or commands (not the conversions/word definition)
 - [ ] Unit conversions
   - [x] F to C (supports both "to" and "in" separators)
-  - [ ] 100 MB to KB (DataUnit enum next)
+  - [x] Data units: B, KB, MB, GB, TB (e.g., `100 MB to KB`)
   - [ ] 50 Mb in 10 sec => 5 MB/sec (bandwidth calculation)
 - [ ] Timezone manipulation (i.e. current time in Tokyo or UTC time)
 - [ ] UI rendering for Wayland
@@ -48,7 +49,7 @@ Input: "32F to C"
 └─────────────────────┘
          │
          ├──► convertTemperature(32, "F to C", buf) → "0.00 C"
-         ├──► convertDataUnit(...)     (TODO)
+         ├──► convertDataUnit(100, "MB to KB", buf) → "102400.00 KB"
          └──► calculateBandwidth(...)  (TODO)
 ```
 - `findSeparator()` handles both " to " and " in "

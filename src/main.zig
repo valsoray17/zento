@@ -100,6 +100,67 @@ const TempUnit = enum {
     }
 };
 
+// Data size units — bytes, KB, MB, GB, TB
+//
+// Using binary units (1 KB = 1024 bytes), which is standard for storage.
+// If you need SI units (1 KB = 1000 bytes), that's a future enhancement.
+const DataUnit = enum {
+    bytes,
+    kb,
+    mb,
+    gb,
+    tb,
+
+    // Parse string to data unit (case-insensitive)
+    // Handles: "B", "KB", "MB", "GB", "TB" (and lowercase variants)
+    fn fromStr(s: []const u8) ?DataUnit {
+        if (s.len == 0) return null;
+
+        // Normalize to lowercase for comparison
+        // Note: We're checking fixed-length prefixes, so this is simple
+        if (s.len >= 2) {
+            const first = std.ascii.toLower(s[0]);
+            const second = std.ascii.toLower(s[1]);
+
+            if (first == 'k' and second == 'b') return .kb;
+            if (first == 'm' and second == 'b') return .mb;
+            if (first == 'g' and second == 'b') return .gb;
+            if (first == 't' and second == 'b') return .tb;
+        }
+
+        // Single character: just "B" for bytes
+        if (s.len >= 1 and (s[0] == 'B' or s[0] == 'b')) {
+            // Make sure it's not "KB", "MB", etc.
+            if (s.len == 1) return .bytes;
+        }
+
+        return null;
+    }
+
+    // Get display string for the unit
+    fn toStr(self: DataUnit) []const u8 {
+        return switch (self) {
+            .bytes => "B",
+            .kb => "KB",
+            .mb => "MB",
+            .gb => "GB",
+            .tb => "TB",
+        };
+    }
+
+    // Multiplier to convert this unit to bytes
+    // Using u64 to handle TB-scale values without overflow
+    fn toBytes(self: DataUnit) u64 {
+        return switch (self) {
+            .bytes => 1,
+            .kb => 1024,
+            .mb => 1024 * 1024,
+            .gb => 1024 * 1024 * 1024,
+            .tb => 1024 * 1024 * 1024 * 1024,
+        };
+    }
+};
+
 // Find conversion separator (" to " or " in ") in input
 // Returns position and length of separator, or null if not found
 fn findSeparator(input: []const u8) ?struct { pos: usize, len: usize } {
@@ -176,6 +237,31 @@ fn convertTemperature(value: f64, rest: []const u8, buf: []u8) ?[]const u8 {
     return formatted;
 }
 
+// Convert data size: "MB to KB" with value 100 → "102400.00 KB"
+//
+// Strategy: convert to bytes first, then to target unit.
+// This avoids needing a conversion table between every pair of units.
+fn convertDataUnit(value: f64, rest: []const u8, buf: []u8) ?[]const u8 {
+    // Find separator (" to " or " in ")
+    const sep = findSeparator(rest) orelse return null;
+
+    // Split: "MB to KB" → "MB" and "KB"
+    const from_str = std.mem.trim(u8, rest[0..sep.pos], " ");
+    const to_str = std.mem.trim(u8, rest[sep.pos + sep.len ..], " ");
+
+    // Parse units — if either fails, this isn't a data unit conversion
+    const from_unit = DataUnit.fromStr(from_str) orelse return null;
+    const to_unit = DataUnit.fromStr(to_str) orelse return null;
+
+    // Convert: value → bytes → target unit
+    const bytes = value * @as(f64, @floatFromInt(from_unit.toBytes()));
+    const result = bytes / @as(f64, @floatFromInt(to_unit.toBytes()));
+
+    // Format result into buffer
+    const formatted = std.fmt.bufPrint(buf, "{d:.2} {s}", .{ result, to_unit.toStr() }) catch return null;
+    return formatted;
+}
+
 // Main conversion dispatcher — tries all conversion types
 fn convert(input: []const u8, buf: []u8) ?[]const u8 {
     // Step 1: Parse number prefix (shared for all conversions)
@@ -183,7 +269,7 @@ fn convert(input: []const u8, buf: []u8) ?[]const u8 {
 
     // Step 2: Try each converter until one succeeds
     if (convertTemperature(parsed.value, parsed.rest, buf)) |result| return result;
-    // Later: if (convertDataUnit(parsed.value, parsed.rest, buf)) |result| return result;
+    if (convertDataUnit(parsed.value, parsed.rest, buf)) |result| return result;
     // Later: if (calculateBandwidth(parsed.value, parsed.rest, buf)) |result| return result;
 
     return null;
