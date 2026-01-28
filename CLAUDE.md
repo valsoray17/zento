@@ -10,6 +10,7 @@ Background: Coming from Go.
 - Quit command
 - Temperature conversion: F ↔ C (e.g., `32F to C`, `100C in F`)
 - Data unit conversion: B, KB, MB, GB, TB (e.g., `100 MB to KB`)
+- StarDict parser (WIP): .ifo and .idx parsing done (`src/stardict.zig`)
 
 ## Next Steps
 - [ ] Application Launcher
@@ -77,9 +78,12 @@ Input: "32F to C"
 ```
 
 **Implementation:**
-1. Parse .idx into word → (offset, size) map
-2. Binary search for word
-3. Read definition from .dict at offset
+- [x] Parse .ifo metadata (bookname, version, wordcount)
+- [x] Parse .idx into word → (offset, size) entries
+- [ ] Load dictionary files from disk
+- [ ] Binary search for word
+- [ ] Read definition from .dict at offset
+- [ ] REPL integration (`define <word>`)
 
 **Resources:**
 - Format spec: github.com/huzheng001/stardict-3/blob/master/dict/doc/StarDictFileFormat
