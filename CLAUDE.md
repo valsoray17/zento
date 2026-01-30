@@ -80,9 +80,9 @@ Input: "32F to C"
 **Implementation:**
 - [x] Parse .ifo metadata (bookname, version, wordcount)
 - [x] Parse .idx into word → (offset, size) entries
-- [ ] Load dictionary files from disk
-- [ ] Binary search for word
-- [ ] Read definition from .dict at offset
+- [x] Binary search / prefix search (`findByPrefix`)
+- [x] Read definition from .dict at offset (`readDefinition`)
+- [ ] Load dictionary files from disk (tie it all together)
 - [ ] REPL integration (`define <word>`)
 
 **Resources:**

@@ -57,6 +57,38 @@ pub fn parseIfo(data: []const u8) ?IfoInfo {
     return info;
 }
 
+test "parseIfo - valid dictionary" {
+    const data =
+        \\StarDict's dict ifo file
+        \\version=3.0.0
+        \\wordcount=123
+        \\bookname=Test Dictionary
+    ;
+
+    const info = parseIfo(data) orelse return error.TestFailed;
+
+    try std.testing.expectEqualStrings("Test Dictionary", info.bookname.?);
+    try std.testing.expectEqual(@as(?usize, 123), info.wordcount);
+    try std.testing.expectEqualStrings("3.0.0", info.version.?);
+}
+
+test "parseIfo - invalid magic header" {
+    const data = "Not a stardict file\nversion=3.0.0\n";
+    const info = parseIfo(data);
+    try std.testing.expect(info == null);
+}
+
+test "parseIfo - empty file" {
+    const info = parseIfo("");
+    try std.testing.expect(info == null);
+}
+
+test "parseIfo - handles CRLF line endings" {
+    const data = "StarDict's dict ifo file\r\nversion=2.4.2\r\nbookname=CRLF Test\r\n";
+    const info = parseIfo(data) orelse return error.TestFailed;
+    try std.testing.expectEqualStrings("CRLF Test", info.bookname.?);
+}
+
 // ============================================================================
 // StarDict .idx Parser
 // ============================================================================
@@ -114,43 +146,6 @@ pub const IdxParser = struct {
         };
     }
 };
-
-// ============================================================================
-// Tests
-// ============================================================================
-// Run with: zig test src/stardict.zig
-
-test "parseIfo - valid dictionary" {
-    const data =
-        \\StarDict's dict ifo file
-        \\version=3.0.0
-        \\wordcount=123
-        \\bookname=Test Dictionary
-    ;
-
-    const info = parseIfo(data) orelse return error.TestFailed;
-
-    try std.testing.expectEqualStrings("Test Dictionary", info.bookname.?);
-    try std.testing.expectEqual(@as(?usize, 123), info.wordcount);
-    try std.testing.expectEqualStrings("3.0.0", info.version.?);
-}
-
-test "parseIfo - invalid magic header" {
-    const data = "Not a stardict file\nversion=3.0.0\n";
-    const info = parseIfo(data);
-    try std.testing.expect(info == null);
-}
-
-test "parseIfo - empty file" {
-    const info = parseIfo("");
-    try std.testing.expect(info == null);
-}
-
-test "parseIfo - handles CRLF line endings" {
-    const data = "StarDict's dict ifo file\r\nversion=2.4.2\r\nbookname=CRLF Test\r\n";
-    const info = parseIfo(data) orelse return error.TestFailed;
-    try std.testing.expectEqualStrings("CRLF Test", info.bookname.?);
-}
 
 test "IdxParser - single entry" {
     // Build binary data: "hi\0" + offset(100) + size(32)
@@ -213,4 +208,212 @@ test "IdxParser - truncated entry (missing size bytes)" {
     };
     var parser = IdxParser{ .data = &data };
     try std.testing.expect(parser.next() == null);
+}
+
+// ============================================================================
+// Index Loading and Lookup
+// ============================================================================
+
+// Parse all .idx entries into an allocated slice
+// wordcount comes from .ifo file - if it's wrong, dictionary is corrupted
+// Caller owns the returned memory and must free with allocator.free()
+//
+// Go equivalent: make([]IdxEntry, wordcount)
+pub fn parseAllEntries(allocator: std.mem.Allocator, idx_data: []const u8, wordcount: usize) ![]IdxEntry {
+    const entries = try allocator.alloc(IdxEntry, wordcount);
+    errdefer allocator.free(entries);
+
+    var parser = IdxParser{ .data = idx_data };
+    var i: usize = 0;
+    while (parser.next()) |entry| {
+        if (i >= wordcount) return error.WordcountMismatch;
+        entries[i] = entry;
+        i += 1;
+    }
+
+    // Verify we got exactly wordcount entries
+    if (i != wordcount) return error.WordcountMismatch;
+
+    return entries;
+}
+
+test "parseAllEntries - parses with wordcount" {
+    const idx_data = [_]u8{
+        'a', 'p', 'e', 0, 0, 0, 0, 0, 0, 0, 0, 10,
+        'a', 'p', 'p', 'l', 'e', 0, 0, 0, 0, 10, 0, 0, 0, 20,
+    };
+
+    const entries = try parseAllEntries(std.testing.allocator, &idx_data, 2);
+    defer std.testing.allocator.free(entries);
+
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("ape", entries[0].word);
+    try std.testing.expectEqualStrings("apple", entries[1].word);
+}
+
+test "parseAllEntries - wordcount mismatch" {
+    const idx_data = [_]u8{
+        'h', 'i', 0, 0, 0, 0, 0, 0, 0, 0, 10,
+    };
+
+    // Claim 5 words but only have 1
+    const result = parseAllEntries(std.testing.allocator, &idx_data, 5);
+    try std.testing.expectError(error.WordcountMismatch, result);
+}
+
+// Find entries matching a prefix (for autocomplete)
+// Returns a slice of the entries array - no allocation needed
+//
+// Uses binary search to find first match, then scans forward
+// Go equivalent: sort.Search + linear scan
+pub fn findByPrefix(entries: []const IdxEntry, prefix: []const u8) []const IdxEntry {
+    if (entries.len == 0 or prefix.len == 0) return entries[0..0];
+
+    // Binary search: find first entry >= prefix
+    var left: usize = 0;
+    var right: usize = entries.len;
+
+    while (left < right) {
+        const mid = left + (right - left) / 2;
+        const word = entries[mid].word;
+
+        // Compare only up to prefix length
+        const cmp_len = @min(word.len, prefix.len);
+        const cmp = std.mem.order(u8, word[0..cmp_len], prefix);
+
+        if (cmp == .lt) {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+
+    // left is now the first entry >= prefix
+    const start = left;
+
+    // Scan forward while prefix matches
+    var end = start;
+    while (end < entries.len) {
+        const word = entries[end].word;
+        if (word.len < prefix.len) break;
+        if (!std.mem.startsWith(u8, word, prefix)) break;
+        end += 1;
+    }
+
+    return entries[start..end];
+}
+
+test "findByPrefix - finds matching entries" {
+    // Sorted entries: ant, ape, apple, apply, banana
+    const entries = [_]IdxEntry{
+        .{ .word = "ant", .offset = 0, .size = 10 },
+        .{ .word = "ape", .offset = 10, .size = 10 },
+        .{ .word = "apple", .offset = 20, .size = 10 },
+        .{ .word = "apply", .offset = 30, .size = 10 },
+        .{ .word = "banana", .offset = 40, .size = 10 },
+    };
+
+    const results = findByPrefix(&entries, "ap");
+    try std.testing.expectEqual(@as(usize, 3), results.len);
+    try std.testing.expectEqualStrings("ape", results[0].word);
+    try std.testing.expectEqualStrings("apple", results[1].word);
+    try std.testing.expectEqualStrings("apply", results[2].word);
+}
+
+test "findByPrefix - exact match" {
+    const entries = [_]IdxEntry{
+        .{ .word = "apple", .offset = 0, .size = 10 },
+        .{ .word = "banana", .offset = 10, .size = 10 },
+    };
+
+    const results = findByPrefix(&entries, "apple");
+    try std.testing.expectEqual(@as(usize, 1), results.len);
+    try std.testing.expectEqualStrings("apple", results[0].word);
+}
+
+test "findByPrefix - no match" {
+    const entries = [_]IdxEntry{
+        .{ .word = "apple", .offset = 0, .size = 10 },
+        .{ .word = "banana", .offset = 10, .size = 10 },
+    };
+
+    const results = findByPrefix(&entries, "zebra");
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+test "findByPrefix - empty prefix returns empty" {
+    const entries = [_]IdxEntry{
+        .{ .word = "apple", .offset = 0, .size = 10 },
+    };
+
+    const results = findByPrefix(&entries, "");
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+}
+
+// ============================================================================
+// Definition Reading
+// ============================================================================
+
+// Read a definition from .dict file given an index entry
+// Seeks to offset and reads size bytes into caller-provided buffer
+// Returns slice of buffer containing the definition, or null on error
+//
+// Go equivalent: file.Seek + file.Read
+pub fn readDefinition(file: std.fs.File, entry: IdxEntry, buf: []u8) ?[]const u8 {
+    if (entry.size > buf.len) return null;
+
+    // Seek to definition offset
+    file.seekTo(entry.offset) catch return null;
+
+    // Read definition into buffer
+    const bytes_read = file.readAll(buf[0..entry.size]) catch return null;
+    if (bytes_read != entry.size) return null;
+
+    return buf[0..entry.size];
+}
+
+test "readDefinition - reads from file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Write test data: "first def" at 0, "second def" at 20
+    {
+        const file = try tmp.dir.createFile("test.dict", .{});
+        defer file.close();
+        try file.writeAll("first def...........second def");
+    }
+
+    // Reopen for reading
+    const file = try tmp.dir.openFile("test.dict", .{});
+    defer file.close();
+
+    const entry1 = IdxEntry{ .word = "a", .offset = 0, .size = 9 };
+    const entry2 = IdxEntry{ .word = "b", .offset = 20, .size = 10 };
+
+    var buf: [64]u8 = undefined;
+
+    const def1 = readDefinition(file, entry1, &buf) orelse return error.TestFailed;
+    try std.testing.expectEqualStrings("first def", def1);
+
+    const def2 = readDefinition(file, entry2, &buf) orelse return error.TestFailed;
+    try std.testing.expectEqualStrings("second def", def2);
+}
+
+test "readDefinition - buffer too small" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile("test.dict", .{});
+        defer file.close();
+        try file.writeAll("some definition text");
+    }
+
+    const file = try tmp.dir.openFile("test.dict", .{});
+    defer file.close();
+
+    const entry = IdxEntry{ .word = "a", .offset = 0, .size = 100 };
+    var buf: [10]u8 = undefined; // Too small for size=100
+
+    try std.testing.expect(readDefinition(file, entry, &buf) == null);
 }
