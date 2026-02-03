@@ -296,8 +296,13 @@ pub fn main() !void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dict_dir = std.fmt.bufPrint(&path_buf, "{s}/.stardict/dic/stardict-dictd-web1913-2.4.2", .{home_path}) catch unreachable;
 
+    var timer = try std.time.Timer.start();
     const dict: ?stardict.Dictionary = stardict.Dictionary.load(std.heap.page_allocator, dict_dir, "dictd_www.dict.org_web1913") catch null;
-    if (dict == null) {
+    const load_time_ms = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_ms;
+
+    if (dict) |d| {
+        try stdout.print("Dictionary loaded: {} words in {d:.1}ms\n", .{ d.entries.len, load_time_ms });
+    } else {
         try stdout.print("Warning: dictionary not loaded\n", .{});
     }
 
