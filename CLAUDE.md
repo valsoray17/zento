@@ -94,3 +94,51 @@ Input: "32F to C"
 **Resources:**
 - Format spec: github.com/huzheng001/stardict-3/blob/master/dict/doc/StarDictFileFormat
 - Dictionaries: stardict.uber.space (Webster's 1913 recommended)
+
+## SystemD Commands Feature
+
+**Goal:** Quick system power commands via D-Bus IPC (no subprocess spawning).
+
+**Commands to support:**
+| Command | REPL syntax | D-Bus method |
+|---------|-------------|--------------|
+| Suspend | `suspend` | `org.freedesktop.login1.Manager.Suspend` |
+| Hibernate | `hibernate` | `org.freedesktop.login1.Manager.Hibernate` |
+| Reboot | `reboot` | `org.freedesktop.login1.Manager.Reboot` |
+| Shutdown | `shutdown` | `org.freedesktop.login1.Manager.PowerOff` |
+| Lock | `lock` | `org.freedesktop.login1.Session.Lock` |
+
+**D-Bus details:**
+- Bus: System bus (`/run/dbus/system_bus_socket`)
+- Service: `org.freedesktop.login1`
+- Object: `/org/freedesktop/login1`
+- Interface: `org.freedesktop.login1.Manager`
+
+**Implementation plan (sd-bus via C interop):**
+- [ ] Add libsystemd to build.zig (`linkSystemLibrary("systemd")`)
+- [ ] Create `src/systemd.zig` with `@cImport` for sd-bus headers
+- [ ] Implement `busConnect()` — open system bus connection
+- [ ] Implement `suspend()` — call `org.freedesktop.login1.Manager.Suspend`
+- [ ] Add remaining commands (hibernate, reboot, poweroff, lock)
+- [ ] Implement `busDisconnect()` — cleanup
+- [ ] REPL integration: match keywords, call functions
+- [ ] Error handling (permission denied, service unavailable)
+
+**sd-bus API overview:**
+```c
+sd_bus *bus;
+sd_bus_open_system(&bus);                    // Connect
+sd_bus_call_method(bus,
+    "org.freedesktop.login1",                // service
+    "/org/freedesktop/login1",               // object path
+    "org.freedesktop.login1.Manager",        // interface
+    "Suspend",                               // method
+    &error, &reply, "b", true);              // args: interactive=true
+sd_bus_unref(bus);                           // Cleanup
+```
+
+**Zig learning points:**
+- `@cImport` / `@cInclude` for C headers
+- `linkSystemLibrary` in build.zig
+- C pointer handling in Zig
+- Translating C error patterns to Zig errors
