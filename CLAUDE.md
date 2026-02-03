@@ -10,13 +10,13 @@ Background: Coming from Go.
 - Quit command
 - Temperature conversion: F ↔ C (e.g., `32F to C`, `100C in F`)
 - Data unit conversion: B, KB, MB, GB, TB (e.g., `100 MB to KB`)
-- StarDict parser (WIP): .ifo and .idx parsing done (`src/stardict.zig`)
+- Dictionary lookup: `dw <word>` using StarDict format (`src/stardict.zig`)
 
 ## Next Steps
 - [ ] Application Launcher
   - [ ] fuzzy finder support (fzf lib based ideally)
 - [ ] SystemD commands integration (suspend, shutdown etc.)
-- [ ] Dictionary/define word (see Dictionary section below)
+- [x] Dictionary/define word (see Dictionary section below)
 - [ ] Remember frequently launched apps or commands (not the conversions/word definition)
 - [ ] Unit conversions
   - [x] F to C (supports both "to" and "in" separators)
@@ -29,6 +29,12 @@ Background: Coming from Go.
 ## Zig Notes
 - Code includes Go-comparison comments for learning
 - Using std library for parsing and I/O
+
+**Language proposals to watch:**
+- [#11520](https://github.com/ziglang/zig/issues/11520) - Implicit named block for declarations (use var name as label in `break :varname`)
+- [#2792](https://github.com/ziglang/zig/issues/2792) - Assign once to `const` initialized to `undefined`
+
+Both address the friction of: "I want `const`, but initialization requires side effects (e.g., logging on error)"
 
 ## Development Approach
 - Iterate one thing at a time for learning
@@ -82,8 +88,8 @@ Input: "32F to C"
 - [x] Parse .idx into word → (offset, size) entries
 - [x] Binary search / prefix search (`findByPrefix`)
 - [x] Read definition from .dict at offset (`readDefinition`)
-- [ ] Load dictionary files from disk (tie it all together)
-- [ ] REPL integration (`define <word>`)
+- [x] Load dictionary files from disk (`Dictionary.load`)
+- [x] REPL integration (`dw <word>`)
 
 **Resources:**
 - Format spec: github.com/huzheng001/stardict-3/blob/master/dict/doc/StarDictFileFormat
