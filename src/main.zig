@@ -1,4 +1,5 @@
 const std = @import("std");
+const stardict = @import("stardict.zig");
 
 // ============================================================================
 // Calculator
@@ -291,10 +292,21 @@ pub fn main() !void {
     try stdout.print("🚀 Launcher v0.1\n", .{});
     try stdout.print("Type 'quit' to exit, anything else to echo\n\n", .{});
 
+    const home_path = std.posix.getenv("HOME") orelse "/tmp";
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dict_dir = std.fmt.bufPrint(&path_buf, "{s}/.stardict/dic/stardict-dictd-web1913-2.4.2", .{home_path}) catch unreachable;
+
+    const dict: ?stardict.Dictionary = stardict.Dictionary.load(std.heap.page_allocator, dict_dir, "dictd_www.dict.org_web1913") catch null;
+    if (dict == null) {
+        try stdout.print("Warning: dictionary not loaded\n", .{});
+    }
+
     // Buffer for reading input
     // In Go: make([]byte, 1024) - but Zig arrays are stack-allocated by default
     // [1024]u8 = array of 1024 bytes (u8 = uint8)
     var buf: [1024]u8 = undefined; // `undefined` = uninitialized (like C)
+                                   //
+    var definition: [32 * 1024]u8 = undefined; // 32KB for large dictionary definitions
 
     // Main loop
     while (true) {
@@ -328,6 +340,21 @@ pub fn main() !void {
             continue;
         }
 
+        // Try dictionary lookup: "dw word"
+        if (std.mem.startsWith(u8, trimmed, "dw ")) {
+            const word = trimmed[3..];
+            const d = dict orelse {
+                try stdout.print("Dictionary not loaded\n", .{});
+                continue;
+            };
+            const def = d.lookup(word, &definition) catch |err| {
+                try stdout.print("Lookup failed for '{s}': {}\n", .{ word, err });
+                continue;
+            };
+            try stdout.print("{s}\n", .{def});
+            continue;
+        }
+
         // Try calculator first
         // `if (optional) |value|` unwraps the optional if it's not null
         // Go equivalent: if result, ok := calculate(input); ok { ... }
@@ -346,4 +373,6 @@ pub fn main() !void {
         // Not a calculation or conversion — echo for now
         try stdout.print("Unknown command: {s}\n", .{trimmed});
     }
+
+    // TODO free up stuff and exit
 }

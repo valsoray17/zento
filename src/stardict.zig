@@ -354,20 +354,27 @@ test "findByPrefix - empty prefix returns empty" {
 // Definition Reading
 // ============================================================================
 
+pub const ReadError = error{
+    BufferTooSmall,
+    SeekFailed,
+    ReadFailed,
+    UnexpectedEof,
+};
+
 // Read a definition from .dict file given an index entry
 // Seeks to offset and reads size bytes into caller-provided buffer
-// Returns slice of buffer containing the definition, or null on error
+// Returns slice of buffer containing the definition
 //
 // Go equivalent: file.Seek + file.Read
-pub fn readDefinition(file: std.fs.File, entry: IdxEntry, buf: []u8) ?[]const u8 {
-    if (entry.size > buf.len) return null;
+pub fn readDefinition(file: std.fs.File, entry: IdxEntry, buf: []u8) ReadError![]const u8 {
+    if (entry.size > buf.len) return error.BufferTooSmall;
 
     // Seek to definition offset
-    file.seekTo(entry.offset) catch return null;
+    file.seekTo(entry.offset) catch return error.SeekFailed;
 
     // Read definition into buffer
-    const bytes_read = file.readAll(buf[0..entry.size]) catch return null;
-    if (bytes_read != entry.size) return null;
+    const bytes_read = file.readAll(buf[0..entry.size]) catch return error.ReadFailed;
+    if (bytes_read != entry.size) return error.UnexpectedEof;
 
     return buf[0..entry.size];
 }
@@ -392,10 +399,10 @@ test "readDefinition - reads from file" {
 
     var buf: [64]u8 = undefined;
 
-    const def1 = readDefinition(file, entry1, &buf) orelse return error.TestFailed;
+    const def1 = try readDefinition(file, entry1, &buf);
     try std.testing.expectEqualStrings("first def", def1);
 
-    const def2 = readDefinition(file, entry2, &buf) orelse return error.TestFailed;
+    const def2 = try readDefinition(file, entry2, &buf);
     try std.testing.expectEqualStrings("second def", def2);
 }
 
@@ -415,5 +422,70 @@ test "readDefinition - buffer too small" {
     const entry = IdxEntry{ .word = "a", .offset = 0, .size = 100 };
     var buf: [10]u8 = undefined; // Too small for size=100
 
-    try std.testing.expect(readDefinition(file, entry, &buf) == null);
+    try std.testing.expectError(error.BufferTooSmall, readDefinition(file, entry, &buf));
 }
+
+// ============================================================================
+// Dictionary (ties everything together)
+// ============================================================================
+
+pub const Dictionary = struct {
+    entries: []IdxEntry,
+    idx_data: []const u8, // entries point into this, must outlive entries
+    dict_file: std.fs.File,
+    allocator: std.mem.Allocator,
+
+    // Load dictionary from a directory containing .ifo, .idx, .dict files
+    // dict_name is the base name (e.g., "webster-1913" for webster-1913.ifo)
+    pub fn load(allocator: std.mem.Allocator, dir_path: []const u8, dict_name: []const u8) !Dictionary {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+        // Read and parse .ifo
+        const ifo_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.ifo", .{ dir_path, dict_name });
+        const ifo_data = try std.fs.cwd().readFileAlloc(allocator, ifo_path, 64 * 1024);
+        defer allocator.free(ifo_data);
+
+        const ifo = parseIfo(ifo_data) orelse return error.InvalidIfo;
+        const wordcount = ifo.wordcount orelse return error.MissingWordcount;
+
+        // Read and parse .idx
+        const idx_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.idx", .{ dir_path, dict_name });
+        const idx_data = try std.fs.cwd().readFileAlloc(allocator, idx_path, 100 * 1024 * 1024);
+        errdefer allocator.free(idx_data);
+
+        const entries = try parseAllEntries(allocator, idx_data, wordcount);
+        errdefer allocator.free(entries);
+
+        // Open .dict file (keep open for seeking)
+        const dict_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.dict", .{ dir_path, dict_name });
+        const dict_file = try std.fs.cwd().openFile(dict_path, .{});
+
+        return Dictionary{
+            .entries = entries,
+            .idx_data = idx_data,
+            .dict_file = dict_file,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Dictionary) void {
+        self.dict_file.close();
+        self.allocator.free(self.entries);
+        self.allocator.free(self.idx_data);
+    }
+
+    // Look up a word and return its definition
+    // Errors: WordNotFound, BufferTooSmall, SeekFailed, ReadFailed, UnexpectedEof
+    pub fn lookup(self: Dictionary, word: []const u8, buf: []u8) ![]const u8 {
+        const matches = findByPrefix(self.entries, word);
+        if (matches.len == 0) return error.WordNotFound;
+
+        // Return first exact match, or first prefix match
+        for (matches) |entry| {
+            if (std.mem.eql(u8, entry.word, word)) {
+                return readDefinition(self.dict_file, entry, buf);
+            }
+        }
+        return readDefinition(self.dict_file, matches[0], buf);
+    }
+};
