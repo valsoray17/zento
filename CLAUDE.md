@@ -90,6 +90,7 @@ Input: "32F to C"
 - [x] Read definition from .dict at offset (`readDefinition`)
 - [x] Load dictionary files from disk (`Dictionary.load`)
 - [x] REPL integration (`dw <word>`)
+- [ ] Case-insensitive lookup (try exact → Title → lower variants)
 
 **Resources:**
 - Format spec: github.com/huzheng001/stardict-3/blob/master/dict/doc/StarDictFileFormat
