@@ -1,5 +1,6 @@
 const std = @import("std");
 const stardict = @import("stardict.zig");
+const systemd = @import("systemd.zig");
 
 // ============================================================================
 // Calculator
@@ -276,6 +277,22 @@ fn convert(input: []const u8, buf: []u8) ?[]const u8 {
     return null;
 }
 
+// Test if it's a systemd command
+const SystemCmd = enum { suspendCmd, hibernate, reboot, shutdown };
+
+fn checkSystemCommand(input: []const u8) ?SystemCmd {
+    return if (std.mem.eql(u8, input, "suspend") or std.mem.eql(u8, input, "sleep"))
+        .suspendCmd
+    else if (std.mem.eql(u8, input, "hibernate"))
+        .hibernate
+    else if (std.mem.eql(u8, input, "reboot"))
+        .reboot
+    else if (std.mem.eql(u8, input, "shutdown"))
+        .shutdown
+    else
+        null;
+}
+
 // ============================================================================
 // Main
 // ============================================================================
@@ -373,6 +390,30 @@ pub fn main() !void {
         if (convert(trimmed, &convert_buf)) |result| {
             try stdout.print("= {s}\n", .{result});
             continue;
+        }
+
+        // Try systemd command
+        if (checkSystemCommand(trimmed)) |cmd| {
+            var bus = systemd.Bus.connectSystem() catch |err| {
+                try stdout.print("D-Bus error: {}\n", .{err});
+                continue;
+            };
+            defer bus.disconnect();
+
+            const result = switch (cmd) {
+                .suspendCmd => bus.doSuspend(),
+                .hibernate => bus.hibernate(),
+                .reboot => bus.reboot(),
+                .shutdown => bus.powerOff(),
+            };
+
+            result catch |err| {
+                try stdout.print("Command failed: {}\n", .{err});
+                continue;
+            };
+
+            try stdout.print("{s}ing...\n", .{@tagName(cmd)});
+            break;
         }
 
         // Not a calculation or conversion — echo for now

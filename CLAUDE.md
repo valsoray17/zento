@@ -11,11 +11,12 @@ Background: Coming from Go.
 - Temperature conversion: F ↔ C (e.g., `32F to C`, `100C in F`)
 - Data unit conversion: B, KB, MB, GB, TB (e.g., `100 MB to KB`)
 - Dictionary lookup: `dw <word>` using StarDict format (`src/stardict.zig`)
+- SystemD commands: `suspend`/`sleep`, `hibernate`, `reboot`, `shutdown` via D-Bus
 
 ## Next Steps
 - [ ] Application Launcher
   - [ ] fuzzy finder support (fzf lib based ideally)
-- [ ] SystemD commands integration (suspend, shutdown etc.)
+- [x] SystemD commands integration (suspend, shutdown etc.)
 - [x] Dictionary/define word (see Dictionary section below)
 - [ ] Remember frequently launched apps or commands (not the conversions/word definition)
 - [ ] Unit conversions
@@ -115,15 +116,15 @@ Input: "32F to C"
 - Object: `/org/freedesktop/login1`
 - Interface: `org.freedesktop.login1.Manager`
 
-**Implementation plan (sd-bus via C interop):**
-- [ ] Add libsystemd to build.zig (`linkSystemLibrary("systemd")`)
-- [ ] Create `src/systemd.zig` with `@cImport` for sd-bus headers
-- [ ] Implement `busConnect()` — open system bus connection
-- [ ] Implement `suspend()` — call `org.freedesktop.login1.Manager.Suspend`
-- [ ] Add remaining commands (hibernate, reboot, poweroff, lock)
-- [ ] Implement `busDisconnect()` — cleanup
-- [ ] REPL integration: match keywords, call functions
-- [ ] Error handling (permission denied, service unavailable)
+**Implementation (sd-bus via C interop):**
+- [x] Add libsystemd to build.zig (`linkSystemLibrary("libsystemd")` — note: `libsystemd` not `systemd`)
+- [x] Create `src/systemd.zig` with `@cImport` for sd-bus headers
+- [x] Implement `Bus.connectSystem()` — open system bus connection
+- [x] Implement power commands (suspend, hibernate, reboot, poweroff)
+- [x] Implement `Bus.disconnect()` — cleanup
+- [x] REPL integration: `checkSystemCommand()` matches keywords, calls Bus methods
+- [x] Error handling (connection failed, method call failed)
+- [ ] Lock command (requires session object path lookup)
 
 **sd-bus API overview:**
 ```c
@@ -140,6 +141,7 @@ sd_bus_unref(bus);                           // Cleanup
 
 **Zig learning points:**
 - `@cImport` / `@cInclude` for C headers
-- `linkSystemLibrary` in build.zig
-- C pointer handling in Zig
-- Translating C error patterns to Zig errors
+- `linkSystemLibrary("libsystemd")` in build.zig (pkg-config name, not package name)
+- `std.mem.zeroes()` for C struct initialization (when C macros can't translate)
+- C pointer handling: `?*c.type` for nullable C pointers
+- Translating C error patterns to Zig errors (negative return = error)

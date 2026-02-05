@@ -15,6 +15,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Link system libraries
+    exe.linkLibC();
+    exe.linkSystemLibrary("libsystemd");
+
     // Install the executable
     b.installArtifact(exe);
 
