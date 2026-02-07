@@ -14,6 +14,8 @@ Background: Coming from Go.
 - SystemD commands: `suspend`/`sleep`, `hibernate`, `reboot`, `shutdown` via D-Bus
 
 ## Next Steps
+- [ ] **Handler refactor for partial input (UI-ready)**
+- [ ] **Wayland UI**
 - [ ] Application Launcher
   - [ ] fuzzy finder support (fzf lib based ideally)
 - [x] SystemD commands integration (suspend, shutdown etc.)
@@ -24,7 +26,6 @@ Background: Coming from Go.
   - [x] Data units: B, KB, MB, GB, TB (e.g., `100 MB to KB`)
   - [ ] 50 Mb in 10 sec => 5 MB/sec (bandwidth calculation)
 - [ ] Timezone manipulation (i.e. current time in Tokyo or UTC time)
-- [ ] UI rendering for Wayland
 - [ ] Support theming
 
 ## Zig Notes
@@ -145,3 +146,139 @@ sd_bus_unref(bus);                           // Cleanup
 - `std.mem.zeroes()` for C struct initialization (when C macros can't translate)
 - C pointer handling: `?*c.type` for nullable C pointers
 - Translating C error patterns to Zig errors (negative return = error)
+
+## Handler Architecture (Partial Input Support)
+
+**Problem:** Current CLI design assumes final input → single result. UI needs:
+- Partial input → multiple candidates
+- As-you-type filtering
+- Different result types (instant values vs executable actions vs previews)
+
+**Current flow (CLI):**
+```
+Input → try handler1() → try handler2() → ... → first non-null result
+```
+
+**New flow (UI-ready):**
+```
+Input → all handlers return []Candidate → merge & rank → display top N
+```
+
+### Candidate Structure
+
+```zig
+const ResultKind = enum {
+    instant,   // Calculator: show value immediately, no action needed
+    action,    // SystemD: execute on Enter
+    preview,   // Dictionary: show definition inline, copy on Enter
+    app,       // App launcher: launch on Enter
+};
+
+const Candidate = struct {
+    label: []const u8,        // Primary display text
+    sublabel: ?[]const u8,    // Secondary text (definition preview, path, etc.)
+    kind: ResultKind,
+    score: f32,               // 0.0-1.0, higher = better match
+
+    // Handler-specific payload for execute()
+    handler_id: u8,           // Which handler owns this
+    data: union {
+        calc_result: f64,
+        system_cmd: SystemCmd,
+        dict_entry: *const IdxEntry,
+        app_path: []const u8,
+    },
+};
+```
+
+### Handler Interface
+
+```zig
+const Handler = struct {
+    name: []const u8,
+
+    // Return candidates for partial input (may return empty slice)
+    // Allocator used for candidate array only, labels point to static/owned data
+    suggest: *const fn(input: []const u8, candidates: []Candidate) usize,
+
+    // Execute selected candidate (for action/preview/app kinds)
+    execute: *const fn(candidate: Candidate) void,
+};
+```
+
+### Handler Behavior by Type
+
+| Handler | Partial Input Behavior | Result Kind |
+|---------|------------------------|-------------|
+| Calculator | Parse as-you-type, show result if valid expression | instant |
+| Temperature | Show result if parseable, else nothing | instant |
+| Data Units | Show result if parseable, else nothing | instant |
+| SystemD | Filter commands by prefix ("sus" → suspend, sleep) | action |
+| Dictionary | Return top N word matches + first definition preview | preview |
+| App Launcher | Fuzzy match .desktop files | app |
+
+### Implementation Plan
+
+1. [ ] Create `src/handler.zig` with Candidate, ResultKind, Handler types
+2. [ ] Refactor calculator → `calcHandler.suggest()` returns 0-1 candidates
+3. [ ] Refactor converters → `convertHandler.suggest()` returns 0-1 candidates
+4. [ ] Refactor systemd → `systemHandler.suggest()` filters by prefix
+5. [ ] Refactor dictionary → `dictHandler.suggest()` uses existing `findByPrefix()`
+6. [ ] Create dispatcher: call all handlers, merge candidates by score
+7. [ ] Update main.zig REPL to use new dispatcher (keep CLI working)
+
+## Wayland UI
+
+**Goal:** Floating overlay window with input field + candidate list.
+
+### UI Components
+
+```
+┌─────────────────────────────────┐
+│ [____input field____________]  │  ← Text entry
+├─────────────────────────────────┤
+│ > suspend          [action]    │  ← Selected candidate (highlighted)
+│   sleep            [action]    │
+│   sublime_text     [app]       │
+│   ...                          │
+└─────────────────────────────────┘
+```
+
+### Technology Stack (Fuzzel-like)
+
+Following fuzzel's proven approach:
+
+| Component | Library | Zig Binding |
+|-----------|---------|-------------|
+| Wayland client | libwayland | [zig-wayland](https://codeberg.org/ifreund/zig-wayland) |
+| Overlay window | wlr-layer-shell | via zig-wayland scanner |
+| Font rendering | fcft | [zig-fcft](https://sr.ht/~novakane/zig-fcft/) |
+| Keyboard | xkbcommon | C interop |
+| Pixel ops | pixman | C interop |
+
+**Why this over GTK4:**
+- Lightweight, no heavy toolkit dependency
+- Zig bindings already exist
+- Better learning opportunity (understand Wayland directly)
+- Proven pattern (fuzzel, foot use this stack)
+
+**fcft vs pango:** fcft is simpler and faster — built for terminals/launchers. Pango is a full text layout engine for i18n, which we don't need for short ASCII labels.
+
+### Implementation Plan
+
+1. [ ] Add zig-wayland dependency, generate protocol bindings
+2. [ ] Connect to Wayland, print available globals
+3. [ ] Create surface with wlr-layer-shell
+4. [ ] Render pixels via wl_shm + pixman
+5. [ ] Add fcft for text rendering
+6. [ ] Handle keyboard via wl_seat + xkbcommon
+7. [ ] Build UI (input field, candidate list, navigation)
+8. [ ] Wire to handler dispatcher
+
+### Wayland Protocols Needed
+
+- `wl_compositor` - create surfaces
+- `wl_shm` - shared memory buffers
+- `wl_seat` + `wl_keyboard` - input
+- `zwlr_layer_shell_v1` - overlay positioning (wlroots extension)
+- `xdg_activation_v1` - focus (if needed)
