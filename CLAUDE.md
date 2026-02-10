@@ -164,6 +164,47 @@ Input → try handler1() → try handler2() → ... → first non-null result
 Input → all handlers return []Candidate → merge & rank → display top N
 ```
 
+### Design Decisions
+
+**Allocator model:** Dispatcher owns an arena allocator, passes it to each handler's
+`suggest()`. Handlers allocate candidates (and any dynamic strings like formatted
+calculator results) from this arena. Arena resets between input changes.
+
+- Most string data costs zero allocation — labels point to comptime literals (systemd
+  command names), pre-loaded data (dictionary words), or cached data (app names from
+  `.desktop` files loaded at startup).
+- Only expression handlers (calculator, converters) need to `allocPrint` result strings
+  from the arena.
+- Candidate structs are ~72 bytes each. Worst case ~50 candidates = ~3.5 KB per keystroke.
+  Arena allocation is just pointer bumping — negligible cost.
+
+**Candidate.action field:** `?[]const u8` carries the command data needed for execute.
+For systemd: the D-Bus method name ("Suspend"). For app launcher: the executable path.
+For instant handlers (calculator): null.
+
+**No progressive filtering in dispatcher:** Initially considered having the dispatcher
+cache candidates and filter on appended keystrokes. Rejected because:
+- Dispatcher would need to know which handlers are prefix-based vs expression-based
+- Expression handlers can widen results on longer input ("1+" → nothing, "1+2" → "= 3")
+- Instead: dispatcher is simple, calls all handlers every keystroke
+- Handlers that benefit from caching (app launcher) optimize internally
+
+**Threading:** Handler interface is thread-safe by design — each `suggest()` receives
+its own allocator and reads only immutable data. For now, sequential execution (all
+handlers are fast). Can add per-handler worker threads later without changing any handler
+code.
+
+**Handler struct:** Struct with function pointers (manual vtable), not a Go-style
+interface. Since all handlers are known at compile time, the dispatcher can also call
+them directly. The struct exists for when we want to iterate over handlers in an array.
+
+### Open Questions
+
+- **Handler identification on Candidate:** When the dispatcher merges candidates from
+  all handlers and the user selects one, how does the dispatcher know which handler's
+  `execute()` to call? Options: handler pointer on Candidate, execute fn pointer on
+  Candidate, or dispatcher tracks origin. Decide when building the dispatcher (step 6).
+
 ### Candidate Structure
 
 ```zig
@@ -171,7 +212,6 @@ const ResultKind = enum {
     instant,   // Calculator: show value immediately, no action needed
     action,    // SystemD: execute on Enter
     preview,   // Dictionary: show definition inline, copy on Enter
-    app,       // App launcher: launch on Enter
 };
 
 const Candidate = struct {
@@ -179,30 +219,20 @@ const Candidate = struct {
     sublabel: ?[]const u8,    // Secondary text (definition preview, path, etc.)
     kind: ResultKind,
     score: f32,               // 0.0-1.0, higher = better match
-
-    // Handler-specific payload for execute()
-    handler_id: u8,           // Which handler owns this
-    data: union {
-        calc_result: f64,
-        system_cmd: SystemCmd,
-        dict_entry: *const IdxEntry,
-        app_path: []const u8,
-    },
+    action: ?[]const u8,      // Command data for execute (method name, app path, etc.)
 };
 ```
 
 ### Handler Interface
 
 ```zig
+const SuggestFn = *const fn (std.mem.Allocator, []const u8) std.mem.Allocator.Error![]Candidate;
+
 const Handler = struct {
     name: []const u8,
-
-    // Return candidates for partial input (may return empty slice)
-    // Allocator used for candidate array only, labels point to static/owned data
-    suggest: *const fn(input: []const u8, candidates: []Candidate) usize,
-
-    // Execute selected candidate (for action/preview/app kinds)
-    execute: *const fn(candidate: Candidate) void,
+    suggest: SuggestFn,
+    // Null for instant-result handlers (calculator) that have no action on Enter
+    execute: ?*const fn (Candidate) anyerror!void = null,
 };
 ```
 
@@ -215,15 +245,15 @@ const Handler = struct {
 | Data Units | Show result if parseable, else nothing | instant |
 | SystemD | Filter commands by prefix ("sus" → suspend, sleep) | action |
 | Dictionary | Return top N word matches + first definition preview | preview |
-| App Launcher | Fuzzy match .desktop files | app |
+| App Launcher | Fuzzy match .desktop files | action |
 
 ### Implementation Plan
 
-1. [ ] Create `src/handler.zig` with Candidate, ResultKind, Handler types
-2. [ ] Refactor calculator → `calcHandler.suggest()` returns 0-1 candidates
-3. [ ] Refactor converters → `convertHandler.suggest()` returns 0-1 candidates
-4. [ ] Refactor systemd → `systemHandler.suggest()` filters by prefix
-5. [ ] Refactor dictionary → `dictHandler.suggest()` uses existing `findByPrefix()`
+1. [x] Create `src/handler.zig` with Candidate, ResultKind, Handler types
+2. [ ] Refactor systemd → `suggest()` prefix-matches entries, `execute()` calls D-Bus
+3. [ ] Refactor calculator → `suggest()` returns 0-1 candidates
+4. [ ] Refactor converters → `suggest()` returns 0-1 candidates
+5. [ ] Refactor dictionary → `suggest()` uses existing `findByPrefix()`
 6. [ ] Create dispatcher: call all handlers, merge candidates by score
 7. [ ] Update main.zig REPL to use new dispatcher (keep CLI working)
 
