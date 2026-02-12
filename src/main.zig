@@ -2,7 +2,7 @@ const std = @import("std");
 const handler = @import("handler.zig");
 const calc = @import("calc.zig");
 const convert = @import("convert.zig");
-const stardict = @import("stardict.zig");
+const dict = @import("dict.zig");
 const systemd = @import("systemd.zig");
 
 // ============================================================================
@@ -26,11 +26,12 @@ pub fn main() !void {
     const dict_dir = std.fmt.bufPrint(&path_buf, "{s}/.stardict/dic/stardict-dictd-web1913-2.4.2", .{home_path}) catch unreachable;
 
     var timer = try std.time.Timer.start();
-    const dict: ?stardict.Dictionary = stardict.Dictionary.load(std.heap.page_allocator, dict_dir, "dictd_www.dict.org_web1913") catch null;
+    dict.init(std.heap.page_allocator, dict_dir, "dictd_www.dict.org_web1913") catch {};
     const load_time_ms = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_ms;
 
-    if (dict) |d| {
-        try stdout.print("Dictionary loaded: {} words in {d:.1}ms\n", .{ d.entries.len, load_time_ms });
+    const wc = dict.wordCount();
+    if (wc > 0) {
+        try stdout.print("Dictionary loaded: {} words in {d:.1}ms\n", .{ wc, load_time_ms });
     } else {
         try stdout.print("Warning: dictionary not loaded\n", .{});
     }
@@ -39,11 +40,16 @@ pub fn main() !void {
     // In Go: make([]byte, 1024) - but Zig arrays are stack-allocated by default
     // [1024]u8 = array of 1024 bytes (u8 = uint8)
     var buf: [1024]u8 = undefined; // `undefined` = uninitialized (like C)
-                                   //
-    var definition: [32 * 1024]u8 = undefined; // 32KB for large dictionary definitions
+
+    // Arena allocator for handler candidates — resets each input cycle.
+    // Sits on top of page_allocator: one mmap for the backing pages,
+    // then just pointer bumping for each alloc. Reset is free (no syscall).
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
 
     // Main loop
     while (true) {
+        _ = arena.reset(.retain_capacity);
         try stdout.print("> ", .{});
 
         // Read a line from stdin
@@ -74,54 +80,41 @@ pub fn main() !void {
             continue;
         }
 
-        // Try dictionary lookup: "dw word"
+        // Dictionary mode: "dw word"
         if (std.mem.startsWith(u8, trimmed, "dw ")) {
-            const word = trimmed[3..];
-            const d = dict orelse {
-                try stdout.print("Dictionary not loaded\n", .{});
-                continue;
-            };
-            const def = d.lookup(word, &definition) catch |err| {
-                try stdout.print("Lookup failed for '{s}': {}\n", .{ word, err });
-                continue;
-            };
-            try stdout.print("{s}\n", .{def});
+            const query = trimmed[3..];
+            const candidates = try dict.suggest(arena.allocator(), query);
+            if (candidates.len > 0 and candidates[0].sublabel != null) {
+                try stdout.print("{s}\n", .{candidates[0].sublabel.?});
+            } else if (candidates.len > 0) {
+                try stdout.print("{s}\n", .{candidates[0].label});
+            } else {
+                try stdout.print("No results for '{s}'\n", .{query});
+            }
             continue;
         }
 
         // Try calculator
-        {
-            const candidates = try calc.suggest(std.heap.page_allocator, trimmed);
-            if (candidates.len > 0) {
-                try stdout.print("{s}\n", .{candidates[0].label});
-                continue;
-            }
+        var candidates = try calc.suggest(arena.allocator(), trimmed);
+        if (candidates.len > 0) {
+            try stdout.print("{s}\n", .{candidates[0].label});
+            continue;
         }
 
         // Try unit conversion
-        {
-            const candidates = try convert.suggest(std.heap.page_allocator, trimmed);
-            if (candidates.len > 0) {
-                try stdout.print("{s}\n", .{candidates[0].label});
-                continue;
-            }
+        candidates = try convert.suggest(arena.allocator(), trimmed);
+        if (candidates.len > 0) {
+            try stdout.print("{s}\n", .{candidates[0].label});
+            continue;
         }
 
-        // Try systemd command (suggest returns candidates matching by prefix)
-        {
-            const candidates = try systemd.suggest(std.heap.page_allocator, trimmed);
-            // CLI mode: only execute exact matches (score == 1.0)
-            var matched: ?handler.Candidate = null;
-            for (candidates) |cand| {
-                if (cand.score == 1.0) {
-                    matched = cand;
-                    break;
-                }
-            }
-            if (matched) |cand| {
+        // Try systemd command (exact match only in CLI)
+        candidates = try systemd.suggest(arena.allocator(), trimmed);
+        for (candidates) |cand| {
+            if (cand.score == 1.0) {
                 systemd.execute(cand) catch |err| {
                     try stdout.print("Command failed: {}\n", .{err});
-                    continue;
+                    break;
                 };
                 try stdout.print("{s}ing...\n", .{cand.label});
                 break;
