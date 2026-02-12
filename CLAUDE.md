@@ -250,10 +250,10 @@ const Handler = struct {
 ### Implementation Plan
 
 1. [x] Create `src/handler.zig` with Candidate, ResultKind, Handler types
-2. [ ] Refactor systemd → `suggest()` prefix-matches entries, `execute()` calls D-Bus
-3. [ ] Refactor calculator → `suggest()` returns 0-1 candidates
-4. [ ] Refactor converters → `suggest()` returns 0-1 candidates
-5. [ ] Refactor dictionary → `suggest()` uses existing `findByPrefix()`
+2. [x] Refactor systemd → `suggest()` prefix-matches entries, `execute()` calls D-Bus
+3. [x] Refactor calculator → `suggest()` returns 0-1 candidates
+4. [x] Refactor converters → `suggest()` returns 0-1 candidates
+5. [x] Refactor dictionary → `suggest()` uses existing `findByPrefix()`
 6. [ ] Create dispatcher: call all handlers, merge candidates by score
 7. [ ] Update main.zig REPL to use new dispatcher (keep CLI working)
 
