@@ -6,15 +6,17 @@ Background: Coming from Go.
 
 ## Current State
 - Basic REPL loop with stdin/stdout
-- Calculator plugin: supports +, -, *, /, % operations
+- Handler architecture: each plugin implements `suggest(allocator, input) → []Candidate`
+  - `src/calc.zig` — calculator (+, -, *, /, %)
+  - `src/convert.zig` — temperature (F↔C) and data units (B, KB, MB, GB, TB)
+  - `src/dict.zig` — dictionary lookup via StarDict (`src/stardict.zig`)
+  - `src/systemd.zig` — power commands via D-Bus (suggest + execute)
+  - `src/handler.zig` — shared types (Candidate, Handler, ResultKind)
+- Arena allocator for handler results, resets each input cycle
 - Quit command
-- Temperature conversion: F ↔ C (e.g., `32F to C`, `100C in F`)
-- Data unit conversion: B, KB, MB, GB, TB (e.g., `100 MB to KB`)
-- Dictionary lookup: `dw <word>` using StarDict format (`src/stardict.zig`)
-- SystemD commands: `suspend`/`sleep`, `hibernate`, `reboot`, `shutdown` via D-Bus
 
 ## Next Steps
-- [ ] **Handler refactor for partial input (UI-ready)**
+- [x] **Handler refactor for partial input (UI-ready)**
 - [ ] **Wayland UI**
 - [ ] Application Launcher
   - [ ] fuzzy finder support (fzf lib based ideally)
