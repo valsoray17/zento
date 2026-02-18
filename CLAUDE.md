@@ -4,6 +4,13 @@
 Learning Zig by building a Raycast-like launcher application.
 Background: Coming from Go.
 
+## Development Approach
+- Always implement changes step-by-step, one piece at a time. Never implement everything at once. Wait for confirmation before moving to the next step.
+- When the user asks to build something incrementally, treat each logical unit as a separate step with its own review cycle.
+
+## Design Discussions
+- When proposing architecture or memory management patterns, present ONE clear recommendation with rationale rather than a confused mix of approaches. If unsure, ask the user which ownership model they prefer before writing code.
+
 ## Current State
 - Basic REPL loop with stdin/stdout
 - Handler architecture: each plugin implements `suggest(allocator, input) → []Candidate`
@@ -280,13 +287,13 @@ const Handler = struct {
 
 Following fuzzel's proven approach:
 
-| Component | Library | Zig Binding |
-|-----------|---------|-------------|
-| Wayland client | libwayland | [zig-wayland](https://codeberg.org/ifreund/zig-wayland) |
-| Overlay window | wlr-layer-shell | via zig-wayland scanner |
-| Font rendering | fcft | [zig-fcft](https://sr.ht/~novakane/zig-fcft/) |
-| Keyboard | xkbcommon | C interop |
-| Pixel ops | pixman | C interop |
+| Component | Library | build.zig link | Zig binding |
+|-----------|---------|----------------|-------------|
+| Wayland client | libwayland | `wayland-client` | zig-wayland v0.3.0 (Zig 0.14) |
+| Overlay window | wlr-layer-shell | (via zig-wayland scanner) | zig-wayland scanner |
+| Font rendering | fcft | `fcft` | `@cImport` (small API, 18 funcs) |
+| Keyboard | xkbcommon | `xkbcommon` | `@cImport` |
+| Pixel ops | pixman | `pixman-1` | `@cImport` |
 
 **Why this over GTK4:**
 - Lightweight, no heavy toolkit dependency
@@ -296,21 +303,88 @@ Following fuzzel's proven approach:
 
 **fcft vs pango:** fcft is simpler and faster — built for terminals/launchers. Pango is a full text layout engine for i18n, which we don't need for short ASCII labels.
 
-### Implementation Plan
+**@cImport vs zig-fcft/zig-pixman:** Using `@cImport` directly for fcft and pixman.
+The API surface is tiny (pixman: create_bits, fill_rectangles, composite32, solid_fill,
+unref; fcft: init/fini, from_name, rasterize_char_utf32, destroy). Same pattern we
+already use for libsystemd. Fewer deps to manage.
 
-1. [ ] Add zig-wayland dependency, generate protocol bindings
-2. [ ] Connect to Wayland, print available globals
-3. [ ] Create surface with wlr-layer-shell
-4. [ ] Render pixels via wl_shm + pixman
-5. [ ] Add fcft for text rendering
-6. [ ] Handle keyboard via wl_seat + xkbcommon
-7. [ ] Build UI (input field, candidate list, navigation)
-8. [ ] Wire to handler dispatcher
+### System Dependencies (Fedora)
+
+```bash
+sudo dnf install wayland-devel wayland-protocols-devel pixman-devel fcft-devel libxkbcommon-devel
+```
 
 ### Wayland Protocols Needed
 
-- `wl_compositor` - create surfaces
-- `wl_shm` - shared memory buffers
-- `wl_seat` + `wl_keyboard` - input
-- `zwlr_layer_shell_v1` - overlay positioning (wlroots extension)
-- `xdg_activation_v1` - focus (if needed)
+| Protocol | Interface | Version | Purpose |
+|----------|-----------|---------|---------|
+| core | `wl_compositor` | 4 | Create surfaces |
+| core | `wl_shm` | 1 | Shared memory pixel buffers |
+| core | `wl_seat` | 7 | Input (keyboard) |
+| core | `wl_output` | 4 | Monitor info for sizing |
+| wlr-layer-shell | `zwlr_layer_shell_v1` | 4 | Overlay positioning |
+
+- `wl_display`, `wl_registry`, `wl_callback`, `wl_buffer` are generated automatically
+- Layer-shell XML vendored in `protocol/wlr-layer-shell-unstable-v1.xml`
+
+### Build Setup
+
+**zig-wayland v0.3.0** added via `build.zig.zon`. Scanner generates Zig bindings from
+protocol XML at build time. Also generates C glue code (`scanner.addCSource(exe)`) that
+libwayland needs for protocol dispatch — required until Zig issue #131 is resolved.
+
+```zig
+// build.zig sketch
+const Scanner = @import("wayland").Scanner;
+const scanner = Scanner.create(b, .{});
+const wayland = b.createModule(.{ .root_source_file = scanner.result });
+
+scanner.addSystemProtocol("stable/xdg-shell/xdg-shell.xml");
+scanner.addCustomProtocol(b.path("protocol/wlr-layer-shell-unstable-v1.xml"));
+
+scanner.generate("wl_compositor", 4);
+scanner.generate("wl_shm", 1);
+scanner.generate("wl_seat", 7);
+scanner.generate("wl_output", 4);
+scanner.generate("zwlr_layer_shell_v1", 4);
+
+exe.root_module.addImport("wayland", wayland);
+exe.linkSystemLibrary("wayland-client");
+scanner.addCSource(exe);
+```
+
+### Rendering Pipeline (per frame)
+
+```
+1. Fill surface with background color  → pixman_image_fill_rectangles(OP_SRC)
+2. Draw selection highlight rectangle  → pixman_image_fill_rectangles(OP_SRC)
+3. Render input text glyph-by-glyph   → fcft_rasterize_char_utf32 + pixman_composite32
+4. Render candidate labels             → same as above
+5. Attach buffer to wl_surface, commit
+```
+
+**Text rendering:** fcft rasterizes each codepoint → `pixman_image_t` glyph. For normal
+glyphs, use glyph->pix as mask with a solid color source (`PIXMAN_OP_OVER`). For color
+glyphs (emoji), use glyph->pix as source directly. Positioning formula:
+`dst_y = pen_y + font->ascent - glyph->y`
+
+### Implementation Plan
+
+1. [ ] **Setup + connect:** Add zig-wayland dep, vendor layer-shell XML, update build.zig,
+       create `src/wayland.zig`, connect to display, print globals
+2. [ ] **Layer-shell surface:** Bind compositor/shm/layer-shell from registry, create
+       surface, set up wl_shm buffer pool (mmap), fill with solid color via pixman, commit
+3. [ ] **Text rendering:** Install fcft-devel, link fcft + pixman, init fcft, load font,
+       render static text onto the pixman surface
+4. [ ] **Keyboard input:** Bind wl_seat, set up keyboard listener, xkbcommon keycode
+       translation, build text input buffer, handle backspace/escape/enter
+5. [ ] **Candidate list:** Layout input field + candidate rows, render labels + sublabels,
+       arrow key navigation with highlight
+6. [ ] **Wire to handlers:** On keystroke → reset arena, call all handlers, collect
+       candidates, sort by score, render list. Enter → execute. Escape → close
+
+### Reference Projects
+
+- [fuzzel](https://codeberg.org/dnkl/fuzzel) — closest reference (launcher, fcft+pixman+layer-shell)
+- [hello-zig-wayland](https://github.com/ifreund/hello-zig-wayland) — minimal zig-wayland example
+- [river](https://github.com/riverwm/river) — full compositor in Zig, build.zig reference

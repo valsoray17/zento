@@ -114,10 +114,10 @@ pub fn main() !void {
             if (cand.score == 1.0) {
                 systemd.execute(cand) catch |err| {
                     try stdout.print("Command failed: {}\n", .{err});
-                    break;
+                    continue;
                 };
                 try stdout.print("{s}ing...\n", .{cand.label});
-                break;
+                continue;
             }
         }
 
