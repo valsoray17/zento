@@ -4,16 +4,25 @@ const calc = @import("calc.zig");
 const convert = @import("convert.zig");
 const dict = @import("dict.zig");
 const systemd = @import("systemd.zig");
+const wayland = @import("wayland.zig");
 
 // ============================================================================
 // Main
 // ============================================================================
 
 pub fn main() !void {
-    // Get a writer to stdout
-    // Go equivalent: os.Stdout or fmt.Print
     const stdout = std.io.getStdOut().writer();
     const stdin = std.io.getStdIn().reader();
+
+    // Dispatch to GUI mode if --gui flag is passed
+    const args = try std.process.argsAlloc(std.heap.page_allocator);
+    defer std.process.argsFree(std.heap.page_allocator, args);
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--gui")) {
+            try wayland.run();
+            return;
+        }
+    }
 
     // Print welcome message
     // `try` is like Go's `if err != nil { return err }`
