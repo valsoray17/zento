@@ -1,7 +1,10 @@
 const std = @import("std");
 const wl = @import("wayland").client.wl;
 const zwlr = @import("wayland").client.zwlr;
-const c = @cImport(@cInclude("pixman-1/pixman.h"));
+const gfx = @cImport({
+    @cInclude("pixman-1/pixman.h");
+    @cInclude("fcft/fcft.h");
+});
 
 // Application state — passed as context pointer to every Wayland listener.
 // All compositor-side objects we own live here so listeners can reach them.
@@ -30,6 +33,14 @@ const App = struct {
 
 pub fn run() !void {
     var app = App{};
+
+    // fcft_init: sets up fontconfig, freetype, logging.
+    // Must be called before any other fcft function.
+    // Args: colorize log output, use syslog, log level.
+    if (!gfx.fcft_init(gfx.FCFT_LOG_COLORIZE_AUTO, false, gfx.FCFT_LOG_CLASS_WARNING)) {
+        return error.FcftInitFailed;
+    }
+    defer gfx.fcft_fini();
 
     // --- Phase 1: connect and discover globals ---
     //
@@ -107,7 +118,23 @@ pub fn run() !void {
     if (display.roundtrip() != .SUCCESS) return error.RoundtripFailed;
     if (!app.configured) return error.NotConfigured;
 
-    // --- Phase 3: shared memory buffer ---
+    // --- Phase 3: load font ---
+    //
+    // fcft_from_name: resolves font name via fontconfig, loads it via freetype.
+    // Takes an array of font names — fcft tries each in order, falling back to
+    // the next if a glyph is missing (useful for emoji fallback fonts).
+    //
+    // The attributes string passes options to fontconfig, e.g. "size=14:weight=bold".
+    // null = use defaults.
+    // [*c]const u8 = C-style pointer to const char (what fcft_from_name expects).
+    // @ptrCast: reinterpret &font_names as the [*c][*c]const u8 the C API wants.
+    var font_names = [_][*c]const u8{"monospace:size=14"};
+    const font = gfx.fcft_from_name(font_names.len, @ptrCast(&font_names), null) orelse {
+        return error.FontLoadFailed;
+    };
+    defer gfx.fcft_destroy(font);
+
+    // --- Phase 4: shared memory buffer ---
     //
     // wl_shm is Wayland's software rendering path — no GPU required.
     //
@@ -152,9 +179,23 @@ pub fn run() !void {
 
     // --- Phase 4: draw and commit ---
     //
-    // pixman wraps our raw pixel data as a pixman_image_t — just a view,
-    // no copy. We fill it with a solid color, then it's ready to send.
-    fillSolid(data, @intCast(WIDTH), @intCast(HEIGHT), @intCast(stride));
+    // Wrap our mmap'd pixel buffer as a pixman image — just a view, no copy.
+    // All drawing operations (fill, text) go through this image.
+    const surface_image = gfx.pixman_image_create_bits(
+        gfx.PIXMAN_a8r8g8b8,
+        @intCast(WIDTH),
+        @intCast(HEIGHT),
+        @ptrCast(@alignCast(data.ptr)),
+        @intCast(stride),
+    ) orelse return error.PixmanImageFailed;
+    defer _ = gfx.pixman_image_unref(surface_image);
+
+    fillSolid(surface_image, @intCast(WIDTH), @intCast(HEIGHT));
+
+    // Render static text centered vertically, 50px from the left.
+    // pen_y is the baseline — ascent pixels above it, descent below.
+    const white = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
+    renderText(surface_image, font, "Hello from Zig!", 50, @intCast(HEIGHT / 2), white);
 
     // Attach buffer: "this is the pixel data for this surface"
     surface.attach(buffer, 0, 0);
@@ -188,23 +229,14 @@ pub fn run() !void {
 //
 // pixman colors are 16-bit per channel (0x0000–0xffff), not 8-bit.
 // 0x1818 ≈ 9% brightness — dark background.
-fn fillSolid(data: []u8, width: i32, height: i32, stride: i32) void {
-    const image = c.pixman_image_create_bits(
-        c.PIXMAN_a8r8g8b8,
-        width,
-        height,
-        @ptrCast(@alignCast(data.ptr)),
-        stride,
-    ) orelse return;
-    defer _ = c.pixman_image_unref(image);
-
-    var color = c.pixman_color_t{
+fn fillSolid(image: *gfx.pixman_image_t, width: i32, height: i32) void {
+    var color = gfx.pixman_color_t{
         .red = 0x1818,
         .green = 0x1818,
         .blue = 0x2828,
         .alpha = 0xffff,
     };
-    var rect = c.pixman_rectangle16_t{
+    var rect = gfx.pixman_rectangle16_t{
         .x = 0,
         .y = 0,
         .width = @intCast(width),
@@ -213,7 +245,59 @@ fn fillSolid(data: []u8, width: i32, height: i32, stride: i32) void {
 
     // OP_SRC: copy source directly, ignoring destination (plain overwrite).
     // OP_OVER would alpha-blend over whatever was there before.
-    _ = c.pixman_image_fill_rectangles(c.PIXMAN_OP_SRC, image, &color, 1, &rect);
+    _ = gfx.pixman_image_fill_rectangles(gfx.PIXMAN_OP_SRC, image, &color, 1, &rect);
+}
+
+// Render a UTF-8 string onto a pixman surface image.
+//
+// pen_x/pen_y: starting position. pen_y is the baseline —
+//   glyphs sit above it (ascent) and hang below it (descent).
+//
+// Rendering pipeline per glyph:
+//   1. fcft rasterizes the codepoint → pixman_image_t (the glyph bitmap)
+//   2. For normal glyphs: composite glyph as a mask over a solid color
+//      (PIXMAN_OP_OVER blends glyph alpha with the destination)
+//   3. Advance pen_x by glyph->advance.x for the next character
+fn renderText(
+    dst: *gfx.pixman_image_t,
+    font: *gfx.struct_fcft_font,
+    text: []const u8,
+    pen_x: i32,
+    pen_y: i32,
+    color: gfx.pixman_color_t,
+) void {
+    // Solid fill image for the text color — used as the source in compositing.
+    // pixman_image_create_solid_fill: a virtual infinite image of one color.
+    var mutable_color = color;
+    const src = gfx.pixman_image_create_solid_fill(&mutable_color) orelse return;
+    defer _ = gfx.pixman_image_unref(src);
+
+    var x = pen_x;
+
+    // Iterate the UTF-8 string codepoint by codepoint.
+    // std.unicode.Utf8View handles multi-byte sequences correctly.
+    var iter = std.unicode.Utf8View.init(text) catch return;
+    var it = iter.iterator();
+    while (it.nextCodepoint()) |cp| {
+        // Rasterize one character. fcft caches rasterized glyphs internally
+        // so repeated calls for the same codepoint are fast.
+        const glyph = gfx.fcft_rasterize_char_utf32(font, cp, gfx.FCFT_SUBPIXEL_DEFAULT) orelse continue;
+
+        // glyph->x/y: offset from pen point to top-left of the glyph bitmap.
+        // y is measured upward from baseline, so we subtract it.
+        const dst_x = x + glyph.*.x;
+        const dst_y = pen_y - glyph.*.y;
+
+        if (glyph.*.is_color_glyph) {
+            // Emoji: glyph->pix is already full ARGB — use as source directly.
+            gfx.pixman_image_composite32(gfx.PIXMAN_OP_OVER, glyph.*.pix, null, dst, 0, 0, 0, 0, dst_x, dst_y, glyph.*.width, glyph.*.height);
+        } else {
+            // Normal glyph: pix is a grayscale mask — composite solid color through it.
+            gfx.pixman_image_composite32(gfx.PIXMAN_OP_OVER, src, glyph.*.pix, dst, 0, 0, 0, 0, dst_x, dst_y, glyph.*.width, glyph.*.height);
+        }
+
+        x += glyph.*.advance.x;
+    }
 }
 
 // Compositor response to our surface.commit().

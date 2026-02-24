@@ -42,6 +42,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("libsystemd");
     exe.linkSystemLibrary("wayland-client");
     exe.linkSystemLibrary("pixman-1");
+    exe.linkSystemLibrary("fcft");
 
     b.installArtifact(exe);
 
