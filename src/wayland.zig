@@ -5,6 +5,7 @@ const gfx = @cImport({
     @cInclude("pixman-1/pixman.h");
     @cInclude("fcft/fcft.h");
 });
+const xkb = @cImport(@cInclude("xkbcommon/xkbcommon.h"));
 
 // Application state — passed as context pointer to every Wayland listener.
 // All compositor-side objects we own live here so listeners can reach them.
@@ -13,6 +14,8 @@ const gfx = @cImport({
 // for a long-running client — passed around instead of using globals.
 const WIDTH: u32 = 600;
 const HEIGHT: u32 = 400;
+const PAD_H: i32 = 20;  // horizontal padding: left margin for text, right margin for sublabels
+const ROW_PAD: i32 = 8; // vertical padding above and below text within each row
 
 const App = struct {
     // Globals: one per interface the compositor advertises in the registry.
@@ -24,6 +27,34 @@ const App = struct {
 
     // Our objects, created after globals are bound.
     layer_surface: ?*zwlr.LayerSurfaceV1 = null,
+    seat: ?*wl.Seat = null,
+    keyboard: ?*wl.Keyboard = null,
+
+    // xkbcommon state — populated when compositor sends the keymap event.
+    // context: global xkb context (needed to create keymaps)
+    // keymap:  the keyboard layout received from the compositor
+    // state:   tracks current modifier state (shift/ctrl/alt/capslock...)
+    xkb_context: ?*xkb.xkb_context = null,
+    xkb_keymap: ?*xkb.xkb_keymap = null,
+    xkb_state: ?*xkb.xkb_state = null,
+
+    // Text input buffer — accumulates keypresses as UTF-8 bytes.
+    // cursor_byte is a byte offset into input_buf (not a codepoint index).
+    // A 4-byte emoji at the start means cursor_byte=4, not cursor_byte=1.
+    input_buf: [512]u8 = undefined,
+    input_len: usize = 0,
+    cursor_byte: usize = 0,
+
+    // Index of the currently highlighted candidate row. Up/Down arrows change it.
+    selected: usize = 0,
+
+    // Drawing resources — set in run() after creation, used by redraw().
+    // Listeners only receive *App, so we store these here rather than
+    // passing them through every call path.
+    surface: ?*wl.Surface = null,
+    surface_image: ?*gfx.pixman_image_t = null,
+    wl_buffer: ?*wl.Buffer = null,
+    font: ?*gfx.struct_fcft_font = null,
 
     // Set to true when compositor sends its first configure event.
     // We must not attach a buffer before that — protocol violation.
@@ -86,6 +117,7 @@ pub fn run() !void {
     //   draw into buffer → commit → compositor atomically swaps it in
     //   No tearing: the swap happens at vblank.
     const surface = try compositor.createSurface();
+    app.surface = surface;
 
     // getLayerSurface args:
     //   surface  — the raw wl_surface to promote
@@ -100,9 +132,10 @@ pub fn run() !void {
     layer_surface.setSize(WIDTH, HEIGHT);
     layer_surface.setAnchor(.{});
 
-    // TODO: switch back to .exclusive when keyboard handling is implemented (step 4).
-    // .none for now so Ctrl+C from the terminal still works during development.
-    layer_surface.setKeyboardInteractivity(.none);
+    // .on_demand: compositor gives us focus when visible, user can still use
+    // compositor shortcuts. .exclusive is for lock screens only — causes bugs
+    // in sway/Hyprland and gives users no escape if the app hangs.
+    layer_surface.setKeyboardInteractivity(.on_demand);
 
     // Register configure/closed listener before committing.
     layer_surface.setListener(*App, layerSurfaceListener, &app);
@@ -133,6 +166,7 @@ pub fn run() !void {
         return error.FontLoadFailed;
     };
     defer gfx.fcft_destroy(font);
+    app.font = font;
 
     // --- Phase 4: shared memory buffer ---
     //
@@ -176,6 +210,7 @@ pub fn run() !void {
     // argb8888: 4 bytes per pixel, [A][R][G][B] in memory order.
     const buffer = try pool.createBuffer(0, @intCast(WIDTH), @intCast(HEIGHT), @intCast(stride), .argb8888);
     defer buffer.destroy();
+    app.wl_buffer = buffer;
 
     // --- Phase 4: draw and commit ---
     //
@@ -189,23 +224,11 @@ pub fn run() !void {
         @intCast(stride),
     ) orelse return error.PixmanImageFailed;
     defer _ = gfx.pixman_image_unref(surface_image);
+    app.surface_image = surface_image;
 
-    fillSolid(surface_image, @intCast(WIDTH), @intCast(HEIGHT));
-
-    // Render static text centered vertically, 50px from the left.
-    // pen_y is the baseline — ascent pixels above it, descent below.
-    const white = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
-    renderText(surface_image, font, "Hello from Zig!", 50, @intCast(HEIGHT / 2), white);
-
-    // Attach buffer: "this is the pixel data for this surface"
-    surface.attach(buffer, 0, 0);
-
-    // damage tells the compositor which region changed and needs repainting.
-    // maxInt = "the whole surface changed" — required or compositor may skip it.
-    surface.damageBuffer(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
-
-    // commit: compositor atomically swaps our buffer in at next vblank. Window appears.
-    surface.commit();
+    // Initial frame: dark background, empty input field.
+    // redraw() is the single code path for all frames — no separate initial draw.
+    redraw(&app);
 
     // --- Phase 5: event loop ---
     //
@@ -216,10 +239,87 @@ pub fn run() !void {
     //
     // For now the loop body is empty — we just keep the window alive.
     // Keyboard handling comes in the next step.
-    std.debug.print("Window open.\n", .{});
+    // xkb_context: global object needed for all xkb operations.
+    // Created once, lives for the duration of the session.
+    app.xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
+        return error.XkbContextFailed;
+    defer xkb.xkb_context_unref(app.xkb_context);
+    defer if (app.xkb_state) |s| xkb.xkb_state_unref(s);
+    defer if (app.xkb_keymap) |k| xkb.xkb_keymap_unref(k);
+
+    std.debug.print("Window open. Press Escape to close.\n", .{});
     while (app.running) {
         if (display.dispatch() != .SUCCESS) break;
     }
+}
+
+// Redraw the window: clear + layout + commit to compositor.
+// Called after every keystroke or selection change.
+fn redraw(app: *App) void {
+    const surface = app.surface orelse return;
+    const image = app.surface_image orelse return;
+    const buffer = app.wl_buffer orelse return;
+    const font = app.font orelse return;
+
+    // Layout metrics derived from font at runtime.
+    // row_h is the same for the input row and every candidate row.
+    // baseline is the pen_y offset within any row.
+    const font_height: i32 = font.*.height;
+    const row_h: i32 = font_height + ROW_PAD * 2;
+    const baseline: i32 = ROW_PAD + font.*.ascent;
+    const sep_y: i32 = row_h; // separator sits right below the input row
+
+    // Colors
+    const col_bg     = gfx.pixman_color_t{ .red = 0x1818, .green = 0x1818, .blue = 0x2828, .alpha = 0xffff };
+    const col_hl     = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
+    const col_sep    = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
+    const col_white  = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
+    const col_prefix = gfx.pixman_color_t{ .red = 0x6666, .green = 0x6666, .blue = 0x8888, .alpha = 0xffff };
+    const col_sub    = gfx.pixman_color_t{ .red = 0x7777, .green = 0x7777, .blue = 0x9999, .alpha = 0xffff };
+
+    // --- Background ---
+    drawRect(image, 0, 0, @intCast(WIDTH), @intCast(HEIGHT), col_bg);
+
+    // --- Input row ---
+    // "> " prefix in muted color, then the typed text in white.
+    const prefix = "> ";
+    renderText(image, font, prefix, PAD_H, baseline, col_prefix);
+    const prefix_w = measureText(font, prefix);
+    renderText(image, font, app.input_buf[0..app.input_len], PAD_H + prefix_w, baseline, col_white);
+
+    // --- Separator ---
+    drawRect(image, 0, sep_y, @intCast(WIDTH), 1, col_sep);
+
+    // --- Candidate rows ---
+    // Hardcoded test data until step 6 wires up the handler dispatcher.
+    const Candidate = struct { label: []const u8, sublabel: []const u8 };
+    const candidates = [_]Candidate{
+        .{ .label = "suspend",  .sublabel = "action" },
+        .{ .label = "sleep",    .sublabel = "action" },
+        .{ .label = "reboot",   .sublabel = "action" },
+        .{ .label = "shutdown", .sublabel = "action" },
+    };
+
+    for (candidates, 0..) |cand, i| {
+        const row_y: i32 = sep_y + 1 + @as(i32, @intCast(i)) * row_h;
+        const pen_y: i32 = row_y + baseline;
+
+        // Highlight the selected row with a full-width rectangle.
+        if (i == app.selected) {
+            drawRect(image, 0, row_y, @intCast(WIDTH), row_h, col_hl);
+        }
+
+        // Label — left-aligned with horizontal padding.
+        renderText(image, font, cand.label, PAD_H, pen_y, col_white);
+
+        // Sublabel — right-aligned: measure first, then position from the right edge.
+        const sub_w = measureText(font, cand.sublabel);
+        renderText(image, font, cand.sublabel, @as(i32, @intCast(WIDTH)) - PAD_H - sub_w, pen_y, col_sub);
+    }
+
+    surface.attach(buffer, 0, 0);
+    surface.damageBuffer(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
+    surface.commit();
 }
 
 // Fill the entire pixel buffer with a solid dark color.
@@ -246,6 +346,32 @@ fn fillSolid(image: *gfx.pixman_image_t, width: i32, height: i32) void {
     // OP_SRC: copy source directly, ignoring destination (plain overwrite).
     // OP_OVER would alpha-blend over whatever was there before.
     _ = gfx.pixman_image_fill_rectangles(gfx.PIXMAN_OP_SRC, image, &color, 1, &rect);
+}
+
+// Measure the pixel width of a UTF-8 string by summing glyph advances.
+// Used to right-align sublabels: pen_x = WIDTH - PAD_H - measureText(font, text)
+fn measureText(font: *gfx.struct_fcft_font, text: []const u8) i32 {
+    var width: i32 = 0;
+    var iter = std.unicode.Utf8View.init(text) catch return 0;
+    var it = iter.iterator();
+    while (it.nextCodepoint()) |cp| {
+        const glyph = gfx.fcft_rasterize_char_utf32(font, cp, gfx.FCFT_SUBPIXEL_DEFAULT) orelse continue;
+        width += glyph.*.advance.x;
+    }
+    return width;
+}
+
+// Draw a filled rectangle at (x, y) with given width, height and color.
+// Used for the separator line (h=1) and candidate highlight (h=row_h).
+fn drawRect(image: *gfx.pixman_image_t, x: i32, y: i32, w: i32, h: i32, color: gfx.pixman_color_t) void {
+    var c = color;
+    var rect = gfx.pixman_rectangle16_t{
+        .x = @intCast(x),
+        .y = @intCast(y),
+        .width = @intCast(w),
+        .height = @intCast(h),
+    };
+    _ = gfx.pixman_image_fill_rectangles(gfx.PIXMAN_OP_SRC, image, &c, 1, &rect);
 }
 
 // Render a UTF-8 string onto a pixman surface image.
@@ -317,6 +443,188 @@ fn layerSurfaceListener(layer_surface: *zwlr.LayerSurfaceV1, event: zwlr.LayerSu
     }
 }
 
+// wl_seat: represents a group of input devices (keyboard + pointer + touch).
+// The capabilities event tells us which are present on this seat.
+fn seatListener(seat: *wl.Seat, event: wl.Seat.Event, app: *App) void {
+    switch (event) {
+        .capabilities => |ev| {
+            // Capability is a packed struct bitfield: .keyboard, .pointer, .touch
+            if (ev.capabilities.keyboard) {
+                const keyboard = seat.getKeyboard() catch return;
+                app.keyboard = keyboard;
+                keyboard.setListener(*App, keyboardListener, app);
+            }
+        },
+        .name => {},
+    }
+}
+
+// wl_keyboard: raw key events from the compositor.
+// At this stage we just print the raw Linux keycode.
+// xkbcommon (piece 2) will translate these to actual characters.
+fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, app: *App) void {
+    switch (event) {
+        .keymap => |ev| {
+            // Compositor sends the keymap once on focus, describing the keyboard layout.
+            // It arrives as a file descriptor containing an XKB text-format string.
+            // We mmap it to read the string, then hand it to xkbcommon.
+            if (ev.format != .xkb_v1) return;
+            defer std.posix.close(ev.fd);
+
+            const map_str = std.posix.mmap(
+                null,
+                ev.size,
+                std.posix.PROT.READ,
+                .{ .TYPE = .PRIVATE },
+                ev.fd,
+                0,
+            ) catch return;
+            defer std.posix.munmap(map_str);
+
+            const keymap = xkb.xkb_keymap_new_from_string(
+                app.xkb_context,
+                map_str.ptr,
+                xkb.XKB_KEYMAP_FORMAT_TEXT_V1,
+                xkb.XKB_KEYMAP_COMPILE_NO_FLAGS,
+            ) orelse return;
+
+            const state = xkb.xkb_state_new(keymap) orelse {
+                xkb.xkb_keymap_unref(keymap);
+                return;
+            };
+
+            // Replace any previous keymap/state (compositor can resend on layout change)
+            if (app.xkb_state) |old| xkb.xkb_state_unref(old);
+            if (app.xkb_keymap) |old| xkb.xkb_keymap_unref(old);
+            app.xkb_keymap = keymap;
+            app.xkb_state = state;
+        },
+        .key => |ev| handleKey(app, ev.key, ev.state),
+        .modifiers => |ev| {
+            // Keep xkb state in sync with Shift/Ctrl/Alt/CapsLock changes.
+            // Without this, xkb_state_key_get_utf32 would ignore modifiers —
+            // 'a' would never become 'A' when Shift is held.
+            if (app.xkb_state) |state| {
+                _ = xkb.xkb_state_update_mask(
+                    state,
+                    ev.mods_depressed, // physically held modifier keys
+                    ev.mods_latched,   // temporarily active (e.g. one-shot shift)
+                    ev.mods_locked,    // toggled (CapsLock)
+                    0, 0,
+                    ev.group,          // keyboard layout group (for multi-layout setups)
+                );
+            }
+        },
+        .enter => {},
+        .leave => {},
+        .repeat_info => {},
+    }
+}
+
+// Handle a single key press event.
+// Extracted from keyboardListener so the outer switch stays a clean event dispatcher.
+fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
+    if (state != .pressed) return;
+
+    // Escape: raw keycode check, no xkb needed
+    if (key == 1) {
+        app.running = false;
+        return;
+    }
+
+    // xkbcommon uses X11 keycodes = Linux evdev keycode + 8
+    const xkb_key = key + 8;
+    const xkb_state = app.xkb_state orelse return;
+    const sym = xkb.xkb_state_key_get_one_sym(xkb_state, xkb_key);
+
+    switch (sym) {
+        xkb.XKB_KEY_BackSpace => {
+            // Remove the codepoint immediately before the cursor.
+            // UTF-8 continuation bytes are 0x80–0xBF (top bits: 10xxxxxx).
+            // Walking backwards past them lands on the sequence's lead byte.
+            if (app.cursor_byte > 0) {
+                var start = app.cursor_byte - 1;
+                while (start > 0 and app.input_buf[start] & 0xC0 == 0x80) : (start -= 1) {}
+                const removed = app.cursor_byte - start;
+                std.mem.copyForwards(u8,
+                    app.input_buf[start .. app.input_len - removed],
+                    app.input_buf[app.cursor_byte .. app.input_len]);
+                app.input_len -= removed;
+                app.cursor_byte = start;
+                redraw(app);
+            }
+        },
+        xkb.XKB_KEY_Delete => {
+            // Remove the codepoint at the cursor (forward delete).
+            if (app.cursor_byte < app.input_len) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(app.input_buf[app.cursor_byte]) catch 1;
+                const end = @min(app.cursor_byte + seq_len, app.input_len);
+                const removed = end - app.cursor_byte;
+                std.mem.copyForwards(u8,
+                    app.input_buf[app.cursor_byte .. app.input_len - removed],
+                    app.input_buf[end .. app.input_len]);
+                app.input_len -= removed;
+                redraw(app);
+            }
+        },
+        xkb.XKB_KEY_Left => {
+            // Move cursor one codepoint left (skip back past continuation bytes).
+            if (app.cursor_byte > 0) {
+                var pos = app.cursor_byte - 1;
+                while (pos > 0 and app.input_buf[pos] & 0xC0 == 0x80) : (pos -= 1) {}
+                app.cursor_byte = pos;
+            }
+        },
+        xkb.XKB_KEY_Right => {
+            // Move cursor one codepoint right.
+            if (app.cursor_byte < app.input_len) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(app.input_buf[app.cursor_byte]) catch 1;
+                app.cursor_byte = @min(app.cursor_byte + seq_len, app.input_len);
+            }
+        },
+        xkb.XKB_KEY_Up => {
+            if (app.selected > 0) {
+                app.selected -= 1;
+                redraw(app);
+            }
+        },
+        xkb.XKB_KEY_Down => {
+            // Clamp to last candidate — step 6 will pass the real count.
+            // 4 = hardcoded test candidates length in redraw().
+            if (app.selected < 3) {
+                app.selected += 1;
+                redraw(app);
+            }
+        },
+        else => {
+            // Printable character: get UTF-8 bytes and insert at cursor.
+            // xkb_state_key_get_utf8 behaves like snprintf: writes up to `size`
+            // bytes (including null), returns the count without null (like snprintf).
+            // Returns 0 for keys that produce no character (F-keys, modifiers, etc.)
+            var char_buf: [8]u8 = undefined;
+            const n_signed = xkb.xkb_state_key_get_utf8(xkb_state, xkb_key, &char_buf, char_buf.len);
+            if (n_signed <= 0) return;
+            const n: usize = @intCast(n_signed);
+
+            // Skip control characters: Ctrl+key produces C0 codes (< 0x20), DEL = 0x7F
+            if (char_buf[0] < 0x20 or char_buf[0] == 0x7F) return;
+
+            // Guard against buffer overflow
+            if (app.input_len + n > app.input_buf.len) return;
+
+            // Shift bytes from cursor rightward to make room, then copy in new bytes.
+            // copyBackwards: overlapping regions, destination is to the right of source.
+            std.mem.copyBackwards(u8,
+                app.input_buf[app.cursor_byte + n .. app.input_len + n],
+                app.input_buf[app.cursor_byte .. app.input_len]);
+            @memcpy(app.input_buf[app.cursor_byte .. app.cursor_byte + n], char_buf[0..n]);
+            app.input_len += n;
+            app.cursor_byte += n;
+            redraw(app);
+        },
+    }
+}
+
 // Called once per global the compositor advertises.
 // We pick the three interfaces we need and bind them.
 //
@@ -336,6 +644,11 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, app: *App)
                 app.shm = registry.bind(g.name, wl.Shm, 1) catch return;
             } else if (std.mem.eql(u8, iface, "zwlr_layer_shell_v1")) {
                 app.layer_shell = registry.bind(g.name, zwlr.LayerShellV1, 4) catch return;
+            } else if (std.mem.eql(u8, iface, "wl_seat")) {
+                // wl_seat represents all input devices (keyboard, pointer, touch).
+                // capabilities event fires immediately telling us what's available.
+                app.seat = registry.bind(g.name, wl.Seat, 7) catch return;
+                app.seat.?.setListener(*App, seatListener, app);
             }
         },
         .global_remove => {},

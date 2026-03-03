@@ -370,18 +370,62 @@ glyphs (emoji), use glyph->pix as source directly. Positioning formula:
 
 ### Implementation Plan
 
-1. [ ] **Setup + connect:** Add zig-wayland dep, vendor layer-shell XML, update build.zig,
+1. [x] **Setup + connect:** Add zig-wayland dep, vendor layer-shell XML, update build.zig,
        create `src/wayland.zig`, connect to display, print globals
-2. [ ] **Layer-shell surface:** Bind compositor/shm/layer-shell from registry, create
+2. [x] **Layer-shell surface:** Bind compositor/shm/layer-shell from registry, create
        surface, set up wl_shm buffer pool (mmap), fill with solid color via pixman, commit
-3. [ ] **Text rendering:** Install fcft-devel, link fcft + pixman, init fcft, load font,
+3. [x] **Text rendering:** Install fcft-devel, link fcft + pixman, init fcft, load font,
        render static text onto the pixman surface
 4. [ ] **Keyboard input:** Bind wl_seat, set up keyboard listener, xkbcommon keycode
        translation, build text input buffer, handle backspace/escape/enter
+       - [x] Piece 1: wl_seat + wl_keyboard listeners, Escape to close
+       - [x] Piece 2: xkbcommon keymap + xkb_state, translate keys to U+XXXX
+       - [x] Piece 3: text input buffer with cursor (insert, backspace, delete, left, right)
+       - [ ] Piece 4: key repeat (timerfd + poll on Wayland fd + timerfd)
+       - [ ] Piece 5: readline shortcuts — Ctrl+A (home), Ctrl+E (end), Ctrl+U (kill to start),
+             Ctrl+K (kill to end), Ctrl+W (delete word back)
 5. [ ] **Candidate list:** Layout input field + candidate rows, render labels + sublabels,
        arrow key navigation with highlight
 6. [ ] **Wire to handlers:** On keystroke → reset arena, call all handlers, collect
        candidates, sort by score, render list. Enter → execute. Escape → close
+
+### Text Input Buffer Design (Step 4 Piece 3)
+
+**Approach:** raw `wl_keyboard` + xkbcommon (same as fuzzel). No text-input protocol needed
+for a launcher — that's for IME/CJK input.
+
+**Key API change:** switch from `xkb_state_key_get_utf32` (single codepoint → manual encode)
+to `xkb_state_key_get_utf8` (writes UTF-8 bytes directly into a temp buffer). Simpler.
+
+**Backspace detection:** check keysym via `xkb_state_key_get_one_sym` for `XKB_KEY_BackSpace`
+rather than raw keycode 14. More portable.
+
+**App fields:**
+```
+input_buf: [512]u8   — byte content of the input field (bytes, not codepoints)
+input_len: usize     — total bytes used (a 4-byte emoji counts as 4)
+cursor_byte: usize   — byte offset where cursor sits (0 = before first char)
+```
+
+**Operations:**
+- Insert at `cursor_byte` → `std.mem.copyBackwards` to shift right, advance cursor
+- Backspace → walk back from `cursor_byte` past UTF-8 continuation bytes (`& 0xC0 == 0x80`),
+  `std.mem.copyForwards` to shift left, move cursor back
+- Delete → same but forward from `cursor_byte`
+- Left arrow → step `cursor_byte` back one codepoint (skip continuation bytes)
+- Right arrow → step `cursor_byte` forward one codepoint (`std.unicode.utf8ByteSequenceLength`)
+- Mouse click → skip for now
+
+**Drawing resources stored in App** (listeners can't receive local vars from run()):
+```
+surface: ?*wl.Surface
+surface_image: ?*gfx.pixman_image_t
+wl_buffer: ?*wl.Buffer
+font: ?*gfx.struct_fcft_font
+```
+
+**redraw(app: *App):** fillSolid → renderText(input_buf[0..input_len]) → attach + damageBuffer + commit
+Initial frame also calls redraw() — same code path, empty buffer = blank dark screen.
 
 ### Reference Projects
 
