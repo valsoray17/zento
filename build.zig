@@ -43,6 +43,7 @@ pub fn build(b: *std.Build) void {
     exe.linkSystemLibrary("wayland-client");
     exe.linkSystemLibrary("pixman-1");
     exe.linkSystemLibrary("fcft");
+    exe.linkSystemLibrary("xkbcommon");
 
     b.installArtifact(exe);
 

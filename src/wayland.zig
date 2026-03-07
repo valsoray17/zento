@@ -1,6 +1,10 @@
 const std = @import("std");
 const wl = @import("wayland").client.wl;
 const zwlr = @import("wayland").client.zwlr;
+const handler = @import("handler.zig");
+const calc = @import("calc.zig");
+const convert = @import("convert.zig");
+const systemd = @import("systemd.zig");
 const gfx = @cImport({
     @cInclude("pixman-1/pixman.h");
     @cInclude("fcft/fcft.h");
@@ -38,16 +42,6 @@ const App = struct {
     xkb_keymap: ?*xkb.xkb_keymap = null,
     xkb_state: ?*xkb.xkb_state = null,
 
-    // Text input buffer — accumulates keypresses as UTF-8 bytes.
-    // cursor_byte is a byte offset into input_buf (not a codepoint index).
-    // A 4-byte emoji at the start means cursor_byte=4, not cursor_byte=1.
-    input_buf: [512]u8 = undefined,
-    input_len: usize = 0,
-    cursor_byte: usize = 0,
-
-    // Index of the currently highlighted candidate row. Up/Down arrows change it.
-    selected: usize = 0,
-
     // Drawing resources — set in run() after creation, used by redraw().
     // Listeners only receive *App, so we store these here rather than
     // passing them through every call path.
@@ -60,6 +54,20 @@ const App = struct {
     // We must not attach a buffer before that — protocol violation.
     configured: bool = false,
     running: bool = true,
+
+    // Text input buffer — accumulates keypresses as UTF-8 bytes.
+    // cursor_byte is a byte offset into input_buf (not a codepoint index).
+    // A 4-byte emoji at the start means cursor_byte=4, not cursor_byte=1.
+    input_buf: [512]u8 = undefined,
+    input_len: usize = 0,
+    cursor_byte: usize = 0,
+
+    // These are the things required for the actual app logic
+    arena: ?*std.heap.ArenaAllocator = null,
+    candidates: []handler.Candidate = &.{},
+    
+    // Index of the currently highlighted candidate row. Up/Down arrows change it.
+    selected: usize = 0,
 };
 
 pub fn run() !void {
@@ -247,9 +255,67 @@ pub fn run() !void {
     defer if (app.xkb_state) |s| xkb.xkb_state_unref(s);
     defer if (app.xkb_keymap) |k| xkb.xkb_keymap_unref(k);
 
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    app.arena = &arena;
+
     std.debug.print("Window open. Press Escape to close.\n", .{});
     while (app.running) {
         if (display.dispatch() != .SUCCESS) break;
+    }
+}
+
+// Collect candidates from all handlers for the current input.
+// Resets the arena first — previous candidates are invalidated.
+// Called after every input change (insert, backspace, delete).
+fn runDispatcher(app: *App) void {
+    const arena = app.arena orelse return;
+    // frees all allocations locally but keeps the backing memory pages mapped
+    _ = arena.reset(.retain_capacity);
+    const alloc = arena.allocator();
+
+    const input = app.input_buf[0..app.input_len];
+    // Empty input - clear
+    if (input.len == 0) {
+        app.candidates = &.{};
+        return;
+    }
+
+    var all = std.ArrayList(handler.Candidate).init(alloc);
+
+    const sources = [_]handler.SuggestFn {
+        calc.suggest,
+        convert.suggest,
+        systemd.suggest,
+    };
+
+    for (sources) |src| {
+        const results = src(alloc, input) catch continue;
+        all.appendSlice(results) catch continue;
+    }
+
+    // Sort by score descending (higher = better match shown first).
+    // std.mem.sort(T, items, context, comptime lessThan):
+    //   T          — element type
+    //   items      — slice to sort in-place
+    //   context    — passed to comparator; {} = empty struct, no context needed
+    //   lessThan   — comptime fn(ctx, a, b) bool — true if a should come before b
+    // The inline struct is an anonymous type with one fn, accessed immediately via .gt.
+    // Zig has no lambda syntax; this is the idiomatic one-off comparator pattern.
+    std.mem.sort(handler.Candidate, all.items, {}, struct {
+        fn gt(_: void, a: handler.Candidate, b: handler.Candidate) bool {
+            return a.score > b.score;
+        }
+    }.gt);
+
+    // cap to what fits on screen
+    const max: usize = 8; // TODO fix this
+    app.candidates = all.items[0..@min(all.items.len, max)]; // love this!
+
+    if (app.candidates.len == 0) {
+        app.selected = 0;
+    } else if (app.selected >= app.candidates.len) {
+        app.selected = app.candidates.len - 1;
     }
 }
 
@@ -290,17 +356,7 @@ fn redraw(app: *App) void {
     // --- Separator ---
     drawRect(image, 0, sep_y, @intCast(WIDTH), 1, col_sep);
 
-    // --- Candidate rows ---
-    // Hardcoded test data until step 6 wires up the handler dispatcher.
-    const Candidate = struct { label: []const u8, sublabel: []const u8 };
-    const candidates = [_]Candidate{
-        .{ .label = "suspend",  .sublabel = "action" },
-        .{ .label = "sleep",    .sublabel = "action" },
-        .{ .label = "reboot",   .sublabel = "action" },
-        .{ .label = "shutdown", .sublabel = "action" },
-    };
-
-    for (candidates, 0..) |cand, i| {
+    for (app.candidates, 0..) |cand, i| {
         const row_y: i32 = sep_y + 1 + @as(i32, @intCast(i)) * row_h;
         const pen_y: i32 = row_y + baseline;
 
@@ -312,9 +368,20 @@ fn redraw(app: *App) void {
         // Label — left-aligned with horizontal padding.
         renderText(image, font, cand.label, PAD_H, pen_y, col_white);
 
-        // Sublabel — right-aligned: measure first, then position from the right edge.
-        const sub_w = measureText(font, cand.sublabel);
-        renderText(image, font, cand.sublabel, @as(i32, @intCast(WIDTH)) - PAD_H - sub_w, pen_y, col_sub);
+        // Sublabel - inline after label, dimmer color
+        if (cand.sublabel) |sub| {
+            const label_w = measureText(font, cand.label);
+            renderText(image, font, sub, PAD_H + label_w + 8, pen_y, col_sub);
+        }
+
+        // Kind tag - right aligned
+        const kind_str: []const u8 = switch (cand.kind) {
+            .instant => "calc",
+            .action => "action",
+            .preview => "dict",
+        };
+        const kind_w = measureText(font, kind_str);
+        renderText(image, font, kind_str, @as(i32, @intCast(WIDTH)) - PAD_H - kind_w, pen_y, col_sub);
     }
 
     surface.attach(buffer, 0, 0);
@@ -516,7 +583,9 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, app: *App) void {
             }
         },
         .enter => {},
-        .leave => {},
+        .leave => {
+            app.running = false;
+        },
         .repeat_info => {},
     }
 }
@@ -551,6 +620,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                     app.input_buf[app.cursor_byte .. app.input_len]);
                 app.input_len -= removed;
                 app.cursor_byte = start;
+                runDispatcher(app);
                 redraw(app);
             }
         },
@@ -564,6 +634,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                     app.input_buf[app.cursor_byte .. app.input_len - removed],
                     app.input_buf[end .. app.input_len]);
                 app.input_len -= removed;
+                runDispatcher(app);
                 redraw(app);
             }
         },
@@ -589,12 +660,20 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             }
         },
         xkb.XKB_KEY_Down => {
-            // Clamp to last candidate — step 6 will pass the real count.
-            // 4 = hardcoded test candidates length in redraw().
-            if (app.selected < 3) {
+            if (app.candidates.len > 0 and app.selected < app.candidates.len - 1) {
                 app.selected += 1;
                 redraw(app);
             }
+        },
+        xkb.XKB_KEY_Return => {
+            if (app.candidates.len == 0) return;
+            const cand = app.candidates[app.selected];
+            if (cand.execute_fn) |exec| {
+                exec(cand) catch |err| {
+                    std.debug.print("execute failed: {}\n", .{err});
+                };
+            }
+            app.running = false;
         },
         else => {
             // Printable character: get UTF-8 bytes and insert at cursor.
@@ -620,6 +699,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             @memcpy(app.input_buf[app.cursor_byte .. app.cursor_byte + n], char_buf[0..n]);
             app.input_len += n;
             app.cursor_byte += n;
+            runDispatcher(app);
             redraw(app);
         },
     }

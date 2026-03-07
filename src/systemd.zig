@@ -91,6 +91,7 @@ pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocato
                 .kind = .action,
                 .score = @as(f32, @floatFromInt(input.len)) / @as(f32, @floatFromInt(entry.keyword.len)),
                 .action = std.mem.span(entry.method),
+                .execute_fn = execute,
             };
             count += 1;
         }
