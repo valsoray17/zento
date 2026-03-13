@@ -13,7 +13,6 @@ pub const Candidate = struct {
     label: []const u8, // "suspend" or "= 8"
     sublabel: ?[]const u8, // "Suspend the system" or null
     kind: ResultKind,
-    score: f32, // 0.0 - 1.0, higher = better match
     /// Handler-specific command data (e.g., D-Bus method name, app path)
     action: ?[]const u8 = null,
     execute_fn: ?ExecuteFn = null,

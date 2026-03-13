@@ -11,8 +11,12 @@ const wayland = @import("wayland.zig");
 // ============================================================================
 
 pub fn main() !void {
-    const stdout = std.io.getStdOut().writer();
-    const stdin = std.io.getStdIn().reader();
+    // Zig 0.15: buffered writer — buffer on stack, flush explicitly.
+    // "Please use buffering! And don't forget to flush!" — release notes.
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_w = std.fs.File.stdout().writer(&stdout_buf);
+    const stdout = &stdout_w.interface;
+    defer stdout.flush() catch {};
 
     // Dispatch to GUI mode if --gui flag is passed
     const args = try std.process.argsAlloc(std.heap.page_allocator);
@@ -28,27 +32,13 @@ pub fn main() !void {
     // `try` is like Go's `if err != nil { return err }`
     // It propagates errors up automatically
     try stdout.print("🚀 Launcher v0.1\n", .{});
-    try stdout.print("Type 'quit' to exit, anything else to echo\n\n", .{});
+    try stdout.print("Type 'quit' to exit\n\n", .{});
 
-    const home_path = std.posix.getenv("HOME") orelse "/tmp";
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const dict_dir = std.fmt.bufPrint(&path_buf, "{s}/.stardict/dic/stardict-dictd-web1913-2.4.2", .{home_path}) catch unreachable;
-
-    var timer = try std.time.Timer.start();
-    dict.init(std.heap.page_allocator, dict_dir, "dictd_www.dict.org_web1913") catch {};
-    const load_time_ms = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_ms;
-
-    const wc = dict.wordCount();
-    if (wc > 0) {
-        try stdout.print("Dictionary loaded: {} words in {d:.1}ms\n", .{ wc, load_time_ms });
-    } else {
-        try stdout.print("Warning: dictionary not loaded\n", .{});
-    }
-
-    // Buffer for reading input
-    // In Go: make([]byte, 1024) - but Zig arrays are stack-allocated by default
-    // [1024]u8 = array of 1024 bytes (u8 = uint8)
-    var buf: [1024]u8 = undefined; // `undefined` = uninitialized (like C)
+    // Zig 0.15: buffered reader — buffer on stack.
+    // takeDelimiterExclusive returns a slice into this buffer (zero-copy).
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_r = std.fs.File.stdin().reader(&stdin_buf);
+    const stdin = &stdin_r.interface;
 
     // Arena allocator for handler candidates — resets each input cycle.
     // Sits on top of page_allocator: one mmap for the backing pages,
@@ -60,22 +50,25 @@ pub fn main() !void {
     while (true) {
         _ = arena.reset(.retain_capacity);
         try stdout.print("> ", .{});
+        // Flush before blocking on stdin so the prompt appears immediately.
+        try stdout.flush();
 
-        // Read a line from stdin
-        // Returns a slice (?[]u8) - the ? means it can be null
+        // Read a line from stdin.
+        // takeDelimiterExclusive: returns slice up to (not including) '\n',
+        // stored in stdin's internal buffer. EOF → error.EndOfStream → break.
         // Go equivalent: reader.ReadString('\n')
-        const line = stdin.readUntilDelimiterOrEof(&buf, '\n') catch |err| {
-            try stdout.print("Error reading input: {}\n", .{err});
-            continue;
+        const input = stdin.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => |e| {
+                try stdout.print("Error reading input: {}\n", .{e});
+                try stdout.flush();
+                continue;
+            },
         };
-
-        // Check for EOF (Ctrl+D)
-        // `orelse` is like Go's `if x == nil { break }`
-        const input = line orelse break;
 
         // Trim whitespace - returns a slice (pointer + length, no allocation)
         // Go equivalent: strings.TrimSpace(input)
-        const trimmed = std.mem.trim(u8, input, " \t\r\n");
+        const trimmed = std.mem.trim(u8, input, " \t\r");
 
         // Check for quit command
         // std.mem.eql compares slices (like bytes.Equal in Go)
@@ -90,6 +83,7 @@ pub fn main() !void {
         }
 
         // Dictionary mode: "dw word"
+        // dict.suggest handles lazy loading internally.
         if (std.mem.startsWith(u8, trimmed, "dw ")) {
             const query = trimmed[3..];
             const candidates = try dict.suggest(arena.allocator(), query);
@@ -120,19 +114,15 @@ pub fn main() !void {
         // Try systemd command (exact match only in CLI)
         candidates = try systemd.suggest(arena.allocator(), trimmed);
         for (candidates) |cand| {
-            if (cand.score == 1.0) {
-                systemd.execute(cand) catch |err| {
-                    try stdout.print("Command failed: {}\n", .{err});
-                    continue;
-                };
-                try stdout.print("{s}ing...\n", .{cand.label});
+            systemd.execute(cand) catch |err| {
+                try stdout.print("Command failed: {}\n", .{err});
                 continue;
-            }
+            };
+            try stdout.print("{s}ing...\n", .{cand.label});
+            continue;
         }
 
         // Not a calculation or conversion — echo for now
         try stdout.print("Unknown command: {s}\n", .{trimmed});
     }
-
-    // TODO free up stuff and exit
 }

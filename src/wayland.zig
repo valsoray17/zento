@@ -3,8 +3,10 @@ const wl = @import("wayland").client.wl;
 const zwlr = @import("wayland").client.zwlr;
 const handler = @import("handler.zig");
 const calc = @import("calc.zig");
+const dict = @import("dict.zig");
 const convert = @import("convert.zig");
 const systemd = @import("systemd.zig");
+const fuzzy = @import("fuzzy.zig");
 const gfx = @cImport({
     @cInclude("pixman-1/pixman.h");
     @cInclude("fcft/fcft.h");
@@ -20,6 +22,34 @@ const WIDTH: u32 = 600;
 const HEIGHT: u32 = 400;
 const PAD_H: i32 = 20;  // horizontal padding: left margin for text, right margin for sublabels
 const ROW_PAD: i32 = 8; // vertical padding above and below text within each row
+
+// Modes
+const Mode = struct {
+    prefix: []const u8,
+    handlers: []const handler.SuggestFn,
+};
+
+const default_mode = Mode {
+    .prefix = "> ",
+    .handlers = &.{ calc.suggest, convert.suggest, systemd.suggest },
+};
+
+const dict_mode = Mode {
+    .prefix = "[dict] ",
+    // potentially can merge multiple dictionaries in the future
+    .handlers = &.{ dict.suggest },
+};
+
+// Input state
+// Text input buffer — accumulates keypresses as UTF-8 bytes.
+// cursor_byte is a byte offset into input_buf (not a codepoint index).
+// A 4-byte emoji at the start means cursor_byte=4, not cursor_byte=1.
+const InputState = struct {
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+    cursor: usize = 0,
+    selected: usize = 0,
+};
 
 const App = struct {
     // Globals: one per interface the compositor advertises in the registry.
@@ -55,19 +85,13 @@ const App = struct {
     configured: bool = false,
     running: bool = true,
 
-    // Text input buffer — accumulates keypresses as UTF-8 bytes.
-    // cursor_byte is a byte offset into input_buf (not a codepoint index).
-    // A 4-byte emoji at the start means cursor_byte=4, not cursor_byte=1.
-    input_buf: [512]u8 = undefined,
-    input_len: usize = 0,
-    cursor_byte: usize = 0,
+    input: InputState = .{},
 
     // These are the things required for the actual app logic
     arena: ?*std.heap.ArenaAllocator = null,
+    mode: *const Mode = &default_mode,
     candidates: []handler.Candidate = &.{},
     
-    // Index of the currently highlighted candidate row. Up/Down arrows change it.
-    selected: usize = 0,
 };
 
 pub fn run() !void {
@@ -274,48 +298,56 @@ fn runDispatcher(app: *App) void {
     _ = arena.reset(.retain_capacity);
     const alloc = arena.allocator();
 
-    const input = app.input_buf[0..app.input_len];
+    const input = app.input.buf[0..app.input.len];
     // Empty input - clear
     if (input.len == 0) {
         app.candidates = &.{};
         return;
     }
 
-    var all = std.ArrayList(handler.Candidate).init(alloc);
-
-    const sources = [_]handler.SuggestFn {
-        calc.suggest,
-        convert.suggest,
-        systemd.suggest,
-    };
-
-    for (sources) |src| {
+    // Stage 1: collect
+    var all: std.ArrayListUnmanaged(handler.Candidate) = .empty;
+    for (app.mode.handlers) |src| {
         const results = src(alloc, input) catch continue;
-        all.appendSlice(results) catch continue;
+        all.appendSlice(alloc, results) catch continue;
     }
 
-    // Sort by score descending (higher = better match shown first).
-    // std.mem.sort(T, items, context, comptime lessThan):
-    //   T          — element type
-    //   items      — slice to sort in-place
-    //   context    — passed to comparator; {} = empty struct, no context needed
-    //   lessThan   — comptime fn(ctx, a, b) bool — true if a should come before b
-    // The inline struct is an anonymous type with one fn, accessed immediately via .gt.
-    // Zig has no lambda syntax; this is the idiomatic one-off comparator pattern.
-    std.mem.sort(handler.Candidate, all.items, {}, struct {
-        fn gt(_: void, a: handler.Candidate, b: handler.Candidate) bool {
-            return a.score > b.score;
+    // Stage 2: score + filter
+    const RankedCandidate = struct { c: handler.Candidate, s: f32 };
+    var scored: std.ArrayListUnmanaged(RankedCandidate) = .empty;
+    for (all.items) |c| {
+        const s: f32 = switch (c.kind) {
+            .instant => 1.0,
+            else     => fuzzy.score(input, c.label),
+        };
+        if (s > 0) scored.append(alloc, .{ .c = c, .s = s }) catch continue;
+    }
+
+    // Stage 3: sort — .instant first, then by score within group.
+    // Explicit kind priority is needed because fuzzy scores can exceed 1.0.
+    std.mem.sort(RankedCandidate, scored.items, {}, struct {
+        fn gt(_: void, a: RankedCandidate, b: RankedCandidate) bool {
+            const a_instant = a.c.kind == .instant;
+            const b_instant = b.c.kind == .instant;
+            if (a_instant != b_instant) return a_instant;
+            return a.s > b.s;
         }
     }.gt);
 
-    // cap to what fits on screen
-    const max: usize = 8; // TODO fix this
-    app.candidates = all.items[0..@min(all.items.len, max)]; // love this!
+    // Stage 4: cap + strip scores — store clean []handler.Candidate
+    // TODO: derive max rows from window height / row_h instead of hardcoding 8
+    const top = scored.items[0..@min(scored.items.len, 8)];
+    const out = alloc.alloc(handler.Candidate, top.len) catch {
+        app.candidates = &.{};
+        return;
+    };
+    for (top, 0..) |ranked, i| out[i] = ranked.c;
+    app.candidates = out;
 
     if (app.candidates.len == 0) {
-        app.selected = 0;
-    } else if (app.selected >= app.candidates.len) {
-        app.selected = app.candidates.len - 1;
+        app.input.selected = 0;
+    } else if (app.input.selected >= app.candidates.len) {
+        app.input.selected = app.candidates.len - 1;
     }
 }
 
@@ -348,10 +380,10 @@ fn redraw(app: *App) void {
 
     // --- Input row ---
     // "> " prefix in muted color, then the typed text in white.
-    const prefix = "> ";
+    const prefix = app.mode.prefix;
     renderText(image, font, prefix, PAD_H, baseline, col_prefix);
     const prefix_w = measureText(font, prefix);
-    renderText(image, font, app.input_buf[0..app.input_len], PAD_H + prefix_w, baseline, col_white);
+    renderText(image, font, app.input.buf[0..app.input.len], PAD_H + prefix_w, baseline, col_white);
 
     // --- Separator ---
     drawRect(image, 0, sep_y, @intCast(WIDTH), 1, col_sep);
@@ -361,7 +393,7 @@ fn redraw(app: *App) void {
         const pen_y: i32 = row_y + baseline;
 
         // Highlight the selected row with a full-width rectangle.
-        if (i == app.selected) {
+        if (i == app.input.selected) {
             drawRect(image, 0, row_y, @intCast(WIDTH), row_h, col_hl);
         }
 
@@ -387,32 +419,6 @@ fn redraw(app: *App) void {
     surface.attach(buffer, 0, 0);
     surface.damageBuffer(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
     surface.commit();
-}
-
-// Fill the entire pixel buffer with a solid dark color.
-//
-// pixman_image_create_bits: wraps raw memory as a pixman image — no copy,
-// pixman just holds a pointer to our mmap'd buffer.
-//
-// pixman colors are 16-bit per channel (0x0000–0xffff), not 8-bit.
-// 0x1818 ≈ 9% brightness — dark background.
-fn fillSolid(image: *gfx.pixman_image_t, width: i32, height: i32) void {
-    var color = gfx.pixman_color_t{
-        .red = 0x1818,
-        .green = 0x1818,
-        .blue = 0x2828,
-        .alpha = 0xffff,
-    };
-    var rect = gfx.pixman_rectangle16_t{
-        .x = 0,
-        .y = 0,
-        .width = @intCast(width),
-        .height = @intCast(height),
-    };
-
-    // OP_SRC: copy source directly, ignoring destination (plain overwrite).
-    // OP_OVER would alpha-blend over whatever was there before.
-    _ = gfx.pixman_image_fill_rectangles(gfx.PIXMAN_OP_SRC, image, &color, 1, &rect);
 }
 
 // Measure the pixel width of a UTF-8 string by summing glyph advances.
@@ -597,7 +603,15 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
 
     // Escape: raw keycode check, no xkb needed
     if (key == 1) {
-        app.running = false;
+        if (app.mode == &default_mode) {
+            // in default mode, close the app
+            app.running = false;
+        } else {
+            app.mode = &default_mode;
+            app.input = .{};
+            runDispatcher(app);
+            redraw(app);
+        }
         return;
     }
 
@@ -611,63 +625,63 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             // Remove the codepoint immediately before the cursor.
             // UTF-8 continuation bytes are 0x80–0xBF (top bits: 10xxxxxx).
             // Walking backwards past them lands on the sequence's lead byte.
-            if (app.cursor_byte > 0) {
-                var start = app.cursor_byte - 1;
-                while (start > 0 and app.input_buf[start] & 0xC0 == 0x80) : (start -= 1) {}
-                const removed = app.cursor_byte - start;
+            if (app.input.cursor > 0) {
+                var start = app.input.cursor - 1;
+                while (start > 0 and app.input.buf[start] & 0xC0 == 0x80) : (start -= 1) {}
+                const removed = app.input.cursor - start;
                 std.mem.copyForwards(u8,
-                    app.input_buf[start .. app.input_len - removed],
-                    app.input_buf[app.cursor_byte .. app.input_len]);
-                app.input_len -= removed;
-                app.cursor_byte = start;
+                    app.input.buf[start .. app.input.len - removed],
+                    app.input.buf[app.input.cursor .. app.input.len]);
+                app.input.len -= removed;
+                app.input.cursor = start;
                 runDispatcher(app);
                 redraw(app);
             }
         },
         xkb.XKB_KEY_Delete => {
             // Remove the codepoint at the cursor (forward delete).
-            if (app.cursor_byte < app.input_len) {
-                const seq_len = std.unicode.utf8ByteSequenceLength(app.input_buf[app.cursor_byte]) catch 1;
-                const end = @min(app.cursor_byte + seq_len, app.input_len);
-                const removed = end - app.cursor_byte;
+            if (app.input.cursor < app.input.len) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(app.input.buf[app.input.cursor]) catch 1;
+                const end = @min(app.input.cursor + seq_len, app.input.len);
+                const removed = end - app.input.cursor;
                 std.mem.copyForwards(u8,
-                    app.input_buf[app.cursor_byte .. app.input_len - removed],
-                    app.input_buf[end .. app.input_len]);
-                app.input_len -= removed;
+                    app.input.buf[app.input.cursor .. app.input.len - removed],
+                    app.input.buf[end .. app.input.len]);
+                app.input.len -= removed;
                 runDispatcher(app);
                 redraw(app);
             }
         },
         xkb.XKB_KEY_Left => {
             // Move cursor one codepoint left (skip back past continuation bytes).
-            if (app.cursor_byte > 0) {
-                var pos = app.cursor_byte - 1;
-                while (pos > 0 and app.input_buf[pos] & 0xC0 == 0x80) : (pos -= 1) {}
-                app.cursor_byte = pos;
+            if (app.input.cursor > 0) {
+                var pos = app.input.cursor - 1;
+                while (pos > 0 and app.input.buf[pos] & 0xC0 == 0x80) : (pos -= 1) {}
+                app.input.cursor = pos;
             }
         },
         xkb.XKB_KEY_Right => {
             // Move cursor one codepoint right.
-            if (app.cursor_byte < app.input_len) {
-                const seq_len = std.unicode.utf8ByteSequenceLength(app.input_buf[app.cursor_byte]) catch 1;
-                app.cursor_byte = @min(app.cursor_byte + seq_len, app.input_len);
+            if (app.input.cursor < app.input.len) {
+                const seq_len = std.unicode.utf8ByteSequenceLength(app.input.buf[app.input.cursor]) catch 1;
+                app.input.cursor = @min(app.input.cursor + seq_len, app.input.len);
             }
         },
         xkb.XKB_KEY_Up => {
-            if (app.selected > 0) {
-                app.selected -= 1;
+            if (app.input.selected > 0) {
+                app.input.selected -= 1;
                 redraw(app);
             }
         },
         xkb.XKB_KEY_Down => {
-            if (app.candidates.len > 0 and app.selected < app.candidates.len - 1) {
-                app.selected += 1;
+            if (app.candidates.len > 0 and app.input.selected < app.candidates.len - 1) {
+                app.input.selected += 1;
                 redraw(app);
             }
         },
         xkb.XKB_KEY_Return => {
             if (app.candidates.len == 0) return;
-            const cand = app.candidates[app.selected];
+            const cand = app.candidates[app.input.selected];
             if (cand.execute_fn) |exec| {
                 exec(cand) catch |err| {
                     std.debug.print("execute failed: {}\n", .{err});
@@ -689,16 +703,24 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             if (char_buf[0] < 0x20 or char_buf[0] == 0x7F) return;
 
             // Guard against buffer overflow
-            if (app.input_len + n > app.input_buf.len) return;
+            if (app.input.len + n > app.input.buf.len) return;
 
             // Shift bytes from cursor rightward to make room, then copy in new bytes.
             // copyBackwards: overlapping regions, destination is to the right of source.
             std.mem.copyBackwards(u8,
-                app.input_buf[app.cursor_byte + n .. app.input_len + n],
-                app.input_buf[app.cursor_byte .. app.input_len]);
-            @memcpy(app.input_buf[app.cursor_byte .. app.cursor_byte + n], char_buf[0..n]);
-            app.input_len += n;
-            app.cursor_byte += n;
+                app.input.buf[app.input.cursor + n .. app.input.len + n],
+                app.input.buf[app.input.cursor .. app.input.len]);
+            @memcpy(app.input.buf[app.input.cursor .. app.input.cursor + n], char_buf[0..n]);
+            app.input.len += n;
+            app.input.cursor += n;
+
+            // TODO improve this. This is a dictionary mode
+            if (app.mode == &default_mode and 
+                std.mem.eql(u8, app.input.buf[0..app.input.len], "dw ")) {
+                app.mode = &dict_mode;
+                app.input = .{};
+            }
+
             runDispatcher(app);
             redraw(app);
         },

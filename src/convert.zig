@@ -193,7 +193,6 @@ pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocato
         .label = label,
         .sublabel = null,
         .kind = .instant,
-        .score = 1.0,
     };
     return candidates[0..1];
 }

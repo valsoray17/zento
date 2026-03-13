@@ -72,29 +72,25 @@ const Entry = struct {
 
 const entries = [_]Entry{
     .{ .keyword = "suspend", .sublabel = "Suspend the system", .method = "Suspend" },
-    .{ .keyword = "sleep", .sublabel = "Suspend the system", .method = "Suspend" },
     .{ .keyword = "hibernate", .sublabel = "Hibernate the system", .method = "Hibernate" },
     .{ .keyword = "reboot", .sublabel = "Reboot the system", .method = "Reboot" },
     .{ .keyword = "shutdown", .sublabel = "Power off the system", .method = "PowerOff" },
 };
 
 /// Return candidates matching input by prefix
-pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]h.Candidate {
+pub fn suggest(allocator: std.mem.Allocator, _: []const u8) std.mem.Allocator.Error![]h.Candidate {
     var candidates = try allocator.alloc(h.Candidate, entries.len);
     var count: usize = 0;
 
     for (entries) |entry| {
-        if (std.mem.startsWith(u8, entry.keyword, input)) {
-            candidates[count] = .{
-                .label = entry.keyword,
-                .sublabel = entry.sublabel,
-                .kind = .action,
-                .score = @as(f32, @floatFromInt(input.len)) / @as(f32, @floatFromInt(entry.keyword.len)),
-                .action = std.mem.span(entry.method),
-                .execute_fn = execute,
-            };
-            count += 1;
-        }
+        candidates[count] = .{
+            .label = entry.keyword,
+            .sublabel = entry.sublabel,
+            .kind = .action,
+            .action = std.mem.span(entry.method),
+            .execute_fn = execute,
+        };
+        count += 1;
     }
 
     return candidates[0..count];
