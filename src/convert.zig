@@ -177,6 +177,12 @@ fn parseNumberPrefix(input: []const u8) ?struct { value: f64, rest: []const u8 }
 // ============================================================================
 // Handler interface
 // ============================================================================
+pub const handler = h.Handler {
+    .name = "convert",
+    .kind = .calc,
+    .on_enter = .close,
+    .source = .{ .suggest = suggest },
+};
 
 /// Return 0 or 1 candidates if input is a valid unit conversion
 pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]h.Candidate {
@@ -192,7 +198,6 @@ pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocato
     candidates[0] = .{
         .label = label,
         .sublabel = null,
-        .kind = .instant,
     };
     return candidates[0..1];
 }

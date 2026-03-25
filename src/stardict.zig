@@ -261,15 +261,42 @@ test "parseAllEntries - wordcount mismatch" {
     try std.testing.expectError(error.WordcountMismatch, result);
 }
 
+// Case-insensitive order matching how dictd tools sort the .idx file.
+// Compares like std.mem.order but folds bytes to lowercase first.
+// The length tie-break is preserved: "War" < "Wart" because after matching
+// 3 equal bytes, the shorter slice wins.
+fn orderCI(a: []const u8, b: []const u8) std.math.Order {
+    const n = @min(a.len, b.len);
+    for (a[0..n], b[0..n]) |ac, bc| {
+        switch (std.math.order(std.ascii.toLower(ac), std.ascii.toLower(bc))) {
+            .eq => {},
+            .lt => return .lt,
+            .gt => return .gt,
+        }
+    }
+    return std.math.order(a.len, b.len);
+}
+
+fn startsWithCI(str: []const u8, prefix: []const u8) bool {
+    if (str.len < prefix.len) return false;
+    for (str[0..prefix.len], prefix) |sc, pc| {
+        if (std.ascii.toLower(sc) != std.ascii.toLower(pc)) return false;
+    }
+    return true;
+}
+
 // Find entries matching a prefix (for autocomplete)
 // Returns a slice of the entries array - no allocation needed
 //
-// Uses binary search to find first match, then scans forward
+// The .idx file is sorted case-insensitively by dictd, so both the binary
+// search and the scan-forward use case-insensitive comparison.  This lets
+// typing "wart" find the entry "Wart" without any query normalisation.
+//
 // Go equivalent: sort.Search + linear scan
 pub fn findByPrefix(entries: []const IdxEntry, prefix: []const u8) []const IdxEntry {
     if (entries.len == 0 or prefix.len == 0) return entries[0..0];
 
-    // Binary search: find first entry >= prefix
+    // Binary search: find first entry >= prefix (case-insensitive)
     var left: usize = 0;
     var right: usize = entries.len;
 
@@ -277,9 +304,10 @@ pub fn findByPrefix(entries: []const IdxEntry, prefix: []const u8) []const IdxEn
         const mid = left + (right - left) / 2;
         const word = entries[mid].word;
 
-        // Compare only up to prefix length
+        // Slice word down to prefix length for comparison so that the length
+        // tie-break inside orderCI correctly ranks "War" < "Wart".
         const cmp_len = @min(word.len, prefix.len);
-        const cmp = std.mem.order(u8, word[0..cmp_len], prefix);
+        const cmp = orderCI(word[0..cmp_len], prefix);
 
         if (cmp == .lt) {
             left = mid + 1;
@@ -291,12 +319,10 @@ pub fn findByPrefix(entries: []const IdxEntry, prefix: []const u8) []const IdxEn
     // left is now the first entry >= prefix
     const start = left;
 
-    // Scan forward while prefix matches
+    // Scan forward while prefix matches (case-insensitive)
     var end = start;
     while (end < entries.len) {
-        const word = entries[end].word;
-        if (word.len < prefix.len) break;
-        if (!std.mem.startsWith(u8, word, prefix)) break;
+        if (!startsWithCI(entries[end].word, prefix)) break;
         end += 1;
     }
 

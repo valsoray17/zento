@@ -31,7 +31,9 @@ pub const Bus = struct {
     }
 
     /// Call a method on org.freedesktop.login1.Manager
-    fn callLogin1Method(self: *Bus, method: [*:0]const u8) !void {
+    fn callLogin1Method(self: *Bus, method: []const u8) !void {
+        var buf: [64]u8 = undefined;
+        const method_z = std.fmt.bufPrintZ(&buf, "{s}", .{method}) catch return error.MethodNameTooLong;
         var err: c.sd_bus_error = std.mem.zeroes(c.sd_bus_error);
         var reply: ?*c.sd_bus_message = null;
 
@@ -45,7 +47,7 @@ pub const Bus = struct {
             "org.freedesktop.login1", // service
             "/org/freedesktop/login1", // object path
             "org.freedesktop.login1.Manager", // interface
-            method, // method name
+            method_z, // method name
             &err,
             &reply,
             "b", // signature: boolean
@@ -67,46 +69,43 @@ pub const Bus = struct {
 const Entry = struct {
     keyword: []const u8,
     sublabel: []const u8,
-    method: [*:0]const u8,
+    method: []const u8,
 };
 
 const entries = [_]Entry{
-    .{ .keyword = "suspend", .sublabel = "Suspend the system", .method = "Suspend" },
-    .{ .keyword = "hibernate", .sublabel = "Hibernate the system", .method = "Hibernate" },
-    .{ .keyword = "reboot", .sublabel = "Reboot the system", .method = "Reboot" },
-    .{ .keyword = "shutdown", .sublabel = "Power off the system", .method = "PowerOff" },
+    .{ .keyword = "Suspend", .sublabel = "Suspend the system", .method = "Suspend" },
+    .{ .keyword = "Hibernate", .sublabel = "Hibernate the system", .method = "Hibernate" },
+    .{ .keyword = "Reboot", .sublabel = "Reboot the system", .method = "Reboot" },
+    .{ .keyword = "Shutdown", .sublabel = "Power off the system", .method = "PowerOff" },
+};
+
+pub const handler = h.Handler{
+    .name = "systemd",
+    .kind = .cmd,
+    .on_enter = .{ .run = execute },
+    .source = .{ .load = load },
 };
 
 /// Return candidates matching input by prefix
-pub fn suggest(allocator: std.mem.Allocator, _: []const u8) std.mem.Allocator.Error![]h.Candidate {
+pub fn load(allocator: std.mem.Allocator) std.mem.Allocator.Error![]h.Candidate {
     var candidates = try allocator.alloc(h.Candidate, entries.len);
-    var count: usize = 0;
 
-    for (entries) |entry| {
-        candidates[count] = .{
+    for (entries, 0..) |entry, i| {
+        candidates[i] = .{
             .label = entry.keyword,
             .sublabel = entry.sublabel,
-            .kind = .action,
-            .action = std.mem.span(entry.method),
-            .execute_fn = execute,
+            .key = entry.method,
         };
-        count += 1;
     }
 
-    return candidates[0..count];
+    return candidates;
 }
 
 /// Execute a systemd command using the candidate's action (D-Bus method name)
-pub fn execute(candidate: h.Candidate) anyerror!void {
-    const action = candidate.action orelse return;
+pub fn execute(key: []const u8) anyerror!void {
     var bus = try Bus.connectSystem();
     defer bus.disconnect();
 
-    for (entries) |entry| {
-        if (std.mem.eql(u8, std.mem.span(entry.method), action)) {
-            try bus.callLogin1Method(entry.method);
-            return;
-        }
-    }
+    try bus.callLogin1Method(key);
 }
 

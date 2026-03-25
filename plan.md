@@ -27,6 +27,20 @@
 
 See `plan-expand.md` for the full design and code snippets.
 
+**Requires a handler/dispatcher architecture refactor** (done as part of Step 7,
+Pieces 1–5 in plan-expand.md):
+- `Candidate` becomes pure data (label, sublabel, key) — no kind, no on_enter
+- `Handler` owns `kind` (ResultKind enum), `on_enter` (OnEnter union), and
+  `source` (Source union: `.load` called once at mode switch, `.suggest` called
+  every keystroke)
+- `RankedEntry` is what the dispatcher builds for the UI — candidate data +
+  handler pointer + score
+- `Mode.handlers` changes from `[]SuggestFn` to `[]const Handler`
+- Static handlers (systemd, apps) use `.load` — result cached, fuzzy-scored each keystroke
+- Expression handlers (calc, convert) use `.suggest` + `.calc` kind — pinned to
+  top when they return a result
+- Dict uses `.suggest` — `findByPrefix` pre-filters before fuzzy scoring
+
 ---
 
 ## Step 8: Scrolling in expanded view

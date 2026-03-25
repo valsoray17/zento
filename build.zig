@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
 
     // --- Executable ---
     const exe = b.addExecutable(.{
-        .name = "launcher",
+        .name = "zento",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,

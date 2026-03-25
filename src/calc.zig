@@ -1,6 +1,13 @@
 const std = @import("std");
 const h = @import("handler.zig");
 
+pub const handler = h.Handler {
+    .name = "calc",
+    .kind = .calc,
+    .on_enter = .close,
+    .source = .{ .suggest = suggest },
+};
+
 /// Try to evaluate a math expression (e.g., "2+3", "10 / 3", "-5+3")
 /// Supports: +, -, *, /, %
 fn calculate(input: []const u8) ?f64 {
@@ -50,7 +57,6 @@ pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocato
     candidates[0] = .{
         .label = label,
         .sublabel = null,
-        .kind = .instant,
     };
     return candidates[0..1];
 }

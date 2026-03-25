@@ -1,12 +1,16 @@
 const std = @import("std");
+
 const wl = @import("wayland").client.wl;
 const zwlr = @import("wayland").client.zwlr;
-const handler = @import("handler.zig");
+
 const calc = @import("calc.zig");
-const dict = @import("dict.zig");
 const convert = @import("convert.zig");
-const systemd = @import("systemd.zig");
+const dict = @import("dict.zig");
 const fuzzy = @import("fuzzy.zig");
+const handler = @import("handler.zig");
+const systemd = @import("systemd.zig");
+const apps = @import("apps.zig");
+
 const gfx = @cImport({
     @cInclude("pixman-1/pixman.h");
     @cInclude("fcft/fcft.h");
@@ -20,24 +24,24 @@ const xkb = @cImport(@cInclude("xkbcommon/xkbcommon.h"));
 // for a long-running client — passed around instead of using globals.
 const WIDTH: u32 = 600;
 const HEIGHT: u32 = 400;
-const PAD_H: i32 = 20;  // horizontal padding: left margin for text, right margin for sublabels
+const PAD_H: i32 = 20; // horizontal padding: left margin for text, right margin for sublabels
 const ROW_PAD: i32 = 8; // vertical padding above and below text within each row
 
 // Modes
 const Mode = struct {
     prefix: []const u8,
-    handlers: []const handler.SuggestFn,
+    handlers: []const *const handler.Handler,
 };
 
-const default_mode = Mode {
+const default_mode = Mode{
     .prefix = "> ",
-    .handlers = &.{ calc.suggest, convert.suggest, systemd.suggest },
+    .handlers = &.{ &calc.handler, &convert.handler, &systemd.handler, &apps.handler },
 };
 
-const dict_mode = Mode {
+const dict_mode = Mode{
     .prefix = "[dict] ",
     // potentially can merge multiple dictionaries in the future
-    .handlers = &.{ dict.suggest },
+    .handlers = &.{&dict.handler},
 };
 
 // Input state
@@ -51,6 +55,13 @@ const InputState = struct {
     selected: usize = 0,
 };
 
+const TaggedCandidate = struct {
+    candidate: handler.Candidate,
+    handler: *const handler.Handler,
+};
+
+const OutputEntry = struct { output: *wl.Output, scale: u32 };
+
 const App = struct {
     // Globals: one per interface the compositor advertises in the registry.
     // We bind each one during the first roundtrip.
@@ -63,6 +74,11 @@ const App = struct {
     layer_surface: ?*zwlr.LayerSurfaceV1 = null,
     seat: ?*wl.Seat = null,
     keyboard: ?*wl.Keyboard = null,
+
+    // Output scale tracking — see OutputEntry above App.
+    // Defaults to 1 until wl_surface.enter fires and tells us the real output.
+    outputs: [8]?OutputEntry = [_]?OutputEntry{null} ** 8,
+    scale: u32 = 1,
 
     // xkbcommon state — populated when compositor sends the keymap event.
     // context: global xkb context (needed to create keymaps)
@@ -90,8 +106,9 @@ const App = struct {
     // These are the things required for the actual app logic
     arena: ?*std.heap.ArenaAllocator = null,
     mode: *const Mode = &default_mode,
-    candidates: []handler.Candidate = &.{},
-    
+    static_candidates: []TaggedCandidate = &.{},
+    candidates: []TaggedCandidate = &.{},
+    expanded: ?[]const u8 = null,
 };
 
 pub fn run() !void {
@@ -150,6 +167,9 @@ pub fn run() !void {
     //   No tearing: the swap happens at vblank.
     const surface = try compositor.createSurface();
     app.surface = surface;
+    // Register surface listener now so wl_surface.enter arrives during the
+    // configure roundtrip and app.scale is set before we create the buffer.
+    surface.setListener(*App, surfaceListener, &app);
 
     // getLayerSurface args:
     //   surface  — the raw wl_surface to promote
@@ -193,7 +213,10 @@ pub fn run() !void {
     // null = use defaults.
     // [*c]const u8 = C-style pointer to const char (what fcft_from_name expects).
     // @ptrCast: reinterpret &font_names as the [*c][*c]const u8 the C API wants.
-    var font_names = [_][*c]const u8{"monospace:size=14"};
+    var font_buf: [64]u8 = undefined;
+    const font_name_z = std.fmt.bufPrintZ(&font_buf, "monospace:size={d}", .{14 * app.scale}) 
+        catch return error.FontNameTooLong;
+    var font_names = [_][*c]const u8{font_name_z.ptr};
     const font = gfx.fcft_from_name(font_names.len, @ptrCast(&font_names), null) orelse {
         return error.FontLoadFailed;
     };
@@ -210,11 +233,14 @@ pub fn run() !void {
     //
     // memfd_create: anonymous RAM-backed file (Linux-specific).
     //   Better than shm_open: no name, no /dev/shm file to clean up on crash.
+    //   w
     //   Lives in RAM, behaves like a regular file (ftruncate, mmap, etc).
-    const stride: u32 = WIDTH * 4; // 4 bytes per pixel: [A][R][G][B]
-    const size: usize = stride * HEIGHT;
+    const physical_w: u32 = WIDTH * app.scale;
+    const physical_h: u32 = HEIGHT * app.scale;
+    const stride: u32 = physical_w * 4; // 4 bytes per pixel: [A][R][G][B]
+    const size: usize = stride * physical_h;
 
-    const fd = try std.posix.memfd_create("launcher-shm", 0);
+    const fd = try std.posix.memfd_create("zento-shm", 0);
     defer std.posix.close(fd);
 
     // Set the file size — starts at 0 bytes by default
@@ -240,7 +266,7 @@ pub fn run() !void {
     // Carve a wl_buffer out of the pool.
     // offset=0: buffer starts at the beginning of the pool.
     // argb8888: 4 bytes per pixel, [A][R][G][B] in memory order.
-    const buffer = try pool.createBuffer(0, @intCast(WIDTH), @intCast(HEIGHT), @intCast(stride), .argb8888);
+    const buffer = try pool.createBuffer(0, @intCast(physical_w), @intCast(physical_h), @intCast(stride), .argb8888);
     defer buffer.destroy();
     app.wl_buffer = buffer;
 
@@ -250,17 +276,13 @@ pub fn run() !void {
     // All drawing operations (fill, text) go through this image.
     const surface_image = gfx.pixman_image_create_bits(
         gfx.PIXMAN_a8r8g8b8,
-        @intCast(WIDTH),
-        @intCast(HEIGHT),
+        @intCast(physical_w),
+        @intCast(physical_h),
         @ptrCast(@alignCast(data.ptr)),
         @intCast(stride),
     ) orelse return error.PixmanImageFailed;
     defer _ = gfx.pixman_image_unref(surface_image);
     app.surface_image = surface_image;
-
-    // Initial frame: dark background, empty input field.
-    // redraw() is the single code path for all frames — no separate initial draw.
-    redraw(&app);
 
     // --- Phase 5: event loop ---
     //
@@ -269,8 +291,6 @@ pub fn run() !void {
     //
     //   socket readable → dispatch() → listeners fire → (render) → repeat
     //
-    // For now the loop body is empty — we just keep the window alive.
-    // Keyboard handling comes in the next step.
     // xkb_context: global object needed for all xkb operations.
     // Created once, lives for the duration of the session.
     app.xkb_context = xkb.xkb_context_new(xkb.XKB_CONTEXT_NO_FLAGS) orelse
@@ -283,10 +303,30 @@ pub fn run() !void {
     defer arena.deinit();
     app.arena = &arena;
 
+    loadMode(&app, &default_mode);
+    runDispatcher(&app);
+    redraw(&app);
+
     std.debug.print("Window open. Press Escape to close.\n", .{});
     while (app.running) {
         if (display.dispatch() != .SUCCESS) break;
     }
+}
+
+fn loadMode(app: *App, mode: *const Mode) void {
+    std.heap.page_allocator.free(app.static_candidates);
+    app.mode = mode;
+
+    var candidates: std.ArrayListUnmanaged(TaggedCandidate) = .empty;
+    for (app.mode.handlers) |h| {
+        switch (h.source) {
+            .load => |f| for (f(std.heap.page_allocator) catch continue) |cand|
+                candidates.append(std.heap.page_allocator, .{ .candidate = cand, .handler = h }) catch continue,
+            .suggest => {},
+        }
+    }
+
+    app.static_candidates = candidates.toOwnedSlice(std.heap.page_allocator) catch &.{};
 }
 
 // Collect candidates from all handlers for the current input.
@@ -299,49 +339,48 @@ fn runDispatcher(app: *App) void {
     const alloc = arena.allocator();
 
     const input = app.input.buf[0..app.input.len];
-    // Empty input - clear
-    if (input.len == 0) {
-        app.candidates = &.{};
-        return;
+
+    // Collect candidates
+    var all: std.ArrayListUnmanaged(TaggedCandidate) = .empty;
+    // static hadlers
+    all.appendSlice(alloc, app.static_candidates) catch {};
+    // dynamic handlers
+    for (app.mode.handlers) |h| {
+        if (input.len == 0) break;
+        switch (h.source) {
+            .suggest => |f| for (f(alloc, input) catch continue) |cand|
+                all.append(alloc, .{ .candidate = cand, .handler = h }) catch continue,
+            .load => {},
+        }
     }
 
-    // Stage 1: collect
-    var all: std.ArrayListUnmanaged(handler.Candidate) = .empty;
-    for (app.mode.handlers) |src| {
-        const results = src(alloc, input) catch continue;
-        all.appendSlice(alloc, results) catch continue;
+    // Score
+    const Ranked = struct { tagged: TaggedCandidate, score: f32 };
+    var ranked: std.ArrayListUnmanaged(Ranked) = .empty;
+    for (all.items) |tc| {
+        const s: f32 = if (tc.handler.kind == .calc) 1.0 else fuzzy.score(input, tc.candidate.label);
+        if (s > 0) ranked.append(alloc, .{ .tagged = tc, .score = s }) catch continue;
     }
 
-    // Stage 2: score + filter
-    const RankedCandidate = struct { c: handler.Candidate, s: f32 };
-    var scored: std.ArrayListUnmanaged(RankedCandidate) = .empty;
-    for (all.items) |c| {
-        const s: f32 = switch (c.kind) {
-            .instant => 1.0,
-            else     => fuzzy.score(input, c.label),
-        };
-        if (s > 0) scored.append(alloc, .{ .c = c, .s = s }) catch continue;
-    }
-
-    // Stage 3: sort — .instant first, then by score within group.
+    // Sort — .calc first, then by score
     // Explicit kind priority is needed because fuzzy scores can exceed 1.0.
-    std.mem.sort(RankedCandidate, scored.items, {}, struct {
-        fn gt(_: void, a: RankedCandidate, b: RankedCandidate) bool {
-            const a_instant = a.c.kind == .instant;
-            const b_instant = b.c.kind == .instant;
-            if (a_instant != b_instant) return a_instant;
-            return a.s > b.s;
+    std.mem.sort(Ranked, ranked.items, {}, struct {
+        fn gt(_: void, a: Ranked, b: Ranked) bool {
+            const a_calc = a.tagged.handler.kind == .calc;
+            const b_calc = b.tagged.handler.kind == .calc;
+            if (a_calc != b_calc) return a_calc;
+            return a.score > b.score;
         }
     }.gt);
 
-    // Stage 4: cap + strip scores — store clean []handler.Candidate
+    // Strip scores - store ordered TaggedCandidate only
     // TODO: derive max rows from window height / row_h instead of hardcoding 8
-    const top = scored.items[0..@min(scored.items.len, 8)];
-    const out = alloc.alloc(handler.Candidate, top.len) catch {
+    const top = ranked.items[0..@min(ranked.items.len, 8)];
+    const out = alloc.alloc(TaggedCandidate, top.len) catch {
         app.candidates = &.{};
         return;
     };
-    for (top, 0..) |ranked, i| out[i] = ranked.c;
+    for (top, 0..) |r, i| out[i] = r.tagged;
     app.candidates = out;
 
     if (app.candidates.len == 0) {
@@ -354,68 +393,90 @@ fn runDispatcher(app: *App) void {
 // Redraw the window: clear + layout + commit to compositor.
 // Called after every keystroke or selection change.
 fn redraw(app: *App) void {
+    // TODO scale changes at runtime should also recreate buffer
     const surface = app.surface orelse return;
     const image = app.surface_image orelse return;
     const buffer = app.wl_buffer orelse return;
     const font = app.font orelse return;
 
+    // TODO move scaled dimensions (w, h, pad, row) into App so they are
+    // computed once on scale
+    const scale: i32 = @intCast(app.scale);
+    const w: i32 = @as(i32, @intCast(WIDTH)) * scale;
+    const h: i32 = @as(i32, @intCast(HEIGHT)) * scale;
+    const pad_h: i32 = PAD_H * scale;
+    const row_pad: i32 = ROW_PAD * scale;
+
     // Layout metrics derived from font at runtime.
     // row_h is the same for the input row and every candidate row.
     // baseline is the pen_y offset within any row.
     const font_height: i32 = font.*.height;
-    const row_h: i32 = font_height + ROW_PAD * 2;
-    const baseline: i32 = ROW_PAD + font.*.ascent;
+    const row_h: i32 = font_height + row_pad * 2;
+    const baseline: i32 = row_pad + font.*.ascent;
     const sep_y: i32 = row_h; // separator sits right below the input row
 
     // Colors
-    const col_bg     = gfx.pixman_color_t{ .red = 0x1818, .green = 0x1818, .blue = 0x2828, .alpha = 0xffff };
-    const col_hl     = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
-    const col_sep    = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
-    const col_white  = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
+    const col_bg = gfx.pixman_color_t{ .red = 0x1818, .green = 0x1818, .blue = 0x2828, .alpha = 0xffff };
+    const col_hl = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
+    const col_sep = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
+    const col_white = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
     const col_prefix = gfx.pixman_color_t{ .red = 0x6666, .green = 0x6666, .blue = 0x8888, .alpha = 0xffff };
-    const col_sub    = gfx.pixman_color_t{ .red = 0x7777, .green = 0x7777, .blue = 0x9999, .alpha = 0xffff };
+    const col_sub = gfx.pixman_color_t{ .red = 0x7777, .green = 0x7777, .blue = 0x9999, .alpha = 0xffff };
 
     // --- Background ---
-    drawRect(image, 0, 0, @intCast(WIDTH), @intCast(HEIGHT), col_bg);
+    drawRect(image, 0, 0, @intCast(w), @intCast(h), col_bg);
 
     // --- Input row ---
     // "> " prefix in muted color, then the typed text in white.
     const prefix = app.mode.prefix;
-    renderText(image, font, prefix, PAD_H, baseline, col_prefix);
+    renderText(image, font, prefix, pad_h, baseline, col_prefix);
     const prefix_w = measureText(font, prefix);
-    renderText(image, font, app.input.buf[0..app.input.len], PAD_H + prefix_w, baseline, col_white);
+    renderText(image, font, app.input.buf[0..app.input.len], pad_h + prefix_w, baseline, col_white);
 
     // --- Separator ---
-    drawRect(image, 0, sep_y, @intCast(WIDTH), 1, col_sep);
+    drawRect(image, 0, sep_y, @intCast(w), 1, col_sep);
 
-    for (app.candidates, 0..) |cand, i| {
-        const row_y: i32 = sep_y + 1 + @as(i32, @intCast(i)) * row_h;
-        const pen_y: i32 = row_y + baseline;
-
-        // Highlight the selected row with a full-width rectangle.
-        if (i == app.input.selected) {
-            drawRect(image, 0, row_y, @intCast(WIDTH), row_h, col_hl);
+    if (app.expanded) |text| {
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        var row: usize = 0;
+        while (lines.next()) |line| {
+            const row_y = sep_y + 1 + @as(i32, @intCast(row)) * row_h;
+            if (row_y + row_h > @as(i32, h)) break;
+            renderText(image, font, line, pad_h, row_y + baseline, col_white);
+            row += 1;
         }
+    } else {
+        for (app.candidates, 0..) |tc, i| {
+            const row_y: i32 = sep_y + 1 + @as(i32, @intCast(i)) * row_h;
+            const pen_y: i32 = row_y + baseline;
 
-        // Label — left-aligned with horizontal padding.
-        renderText(image, font, cand.label, PAD_H, pen_y, col_white);
+            // Highlight the selected row with a full-width rectangle.
+            if (i == app.input.selected) {
+                drawRect(image, 0, row_y, @intCast(w), row_h, col_hl);
+            }
 
-        // Sublabel - inline after label, dimmer color
-        if (cand.sublabel) |sub| {
-            const label_w = measureText(font, cand.label);
-            renderText(image, font, sub, PAD_H + label_w + 8, pen_y, col_sub);
+            // Label — left-aligned with horizontal padding.
+            renderText(image, font, tc.candidate.label, pad_h, pen_y, col_white);
+
+            // Sublabel - inline after label, dimmer color
+            if (tc.candidate.sublabel) |sub| {
+                const label_w = measureText(font, tc.candidate.label);
+                renderText(image, font, sub, pad_h + label_w + 8, pen_y, col_sub);
+            }
+
+            // Kind tag - right aligned
+            const kind_str: []const u8 = switch (tc.handler.kind) {
+                .calc => "calc",
+                .cmd => "command",
+                .app => "application",
+                .dict => "dictionary",
+            };
+            const kind_w = measureText(font, kind_str);
+            renderText(image, font, kind_str, @as(i32, @intCast(w)) - pad_h - kind_w, pen_y, col_sub);
         }
-
-        // Kind tag - right aligned
-        const kind_str: []const u8 = switch (cand.kind) {
-            .instant => "calc",
-            .action => "action",
-            .preview => "dict",
-        };
-        const kind_w = measureText(font, kind_str);
-        renderText(image, font, kind_str, @as(i32, @intCast(WIDTH)) - PAD_H - kind_w, pen_y, col_sub);
     }
 
+    surface.setBufferScale(scale);
     surface.attach(buffer, 0, 0);
     surface.damageBuffer(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
     surface.commit();
@@ -581,10 +642,11 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, app: *App) void {
                 _ = xkb.xkb_state_update_mask(
                     state,
                     ev.mods_depressed, // physically held modifier keys
-                    ev.mods_latched,   // temporarily active (e.g. one-shot shift)
-                    ev.mods_locked,    // toggled (CapsLock)
-                    0, 0,
-                    ev.group,          // keyboard layout group (for multi-layout setups)
+                    ev.mods_latched, // temporarily active (e.g. one-shot shift)
+                    ev.mods_locked, // toggled (CapsLock)
+                    0,
+                    0,
+                    ev.group, // keyboard layout group (for multi-layout setups)
                 );
             }
         },
@@ -603,11 +665,17 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
 
     // Escape: raw keycode check, no xkb needed
     if (key == 1) {
-        if (app.mode == &default_mode) {
+        if (app.expanded != null) {
+            // we are in expanded mode
+            std.heap.page_allocator.free(app.expanded.?);
+            app.expanded = null;
+            redraw(app);
+        } else if (app.mode == &default_mode) {
             // in default mode, close the app
             app.running = false;
         } else {
-            app.mode = &default_mode;
+            // we are one level into another mode
+            loadMode(app, &default_mode);
             app.input = .{};
             runDispatcher(app);
             redraw(app);
@@ -629,9 +697,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                 var start = app.input.cursor - 1;
                 while (start > 0 and app.input.buf[start] & 0xC0 == 0x80) : (start -= 1) {}
                 const removed = app.input.cursor - start;
-                std.mem.copyForwards(u8,
-                    app.input.buf[start .. app.input.len - removed],
-                    app.input.buf[app.input.cursor .. app.input.len]);
+                std.mem.copyForwards(u8, app.input.buf[start .. app.input.len - removed], app.input.buf[app.input.cursor..app.input.len]);
                 app.input.len -= removed;
                 app.input.cursor = start;
                 runDispatcher(app);
@@ -644,9 +710,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                 const seq_len = std.unicode.utf8ByteSequenceLength(app.input.buf[app.input.cursor]) catch 1;
                 const end = @min(app.input.cursor + seq_len, app.input.len);
                 const removed = end - app.input.cursor;
-                std.mem.copyForwards(u8,
-                    app.input.buf[app.input.cursor .. app.input.len - removed],
-                    app.input.buf[end .. app.input.len]);
+                std.mem.copyForwards(u8, app.input.buf[app.input.cursor .. app.input.len - removed], app.input.buf[end..app.input.len]);
                 app.input.len -= removed;
                 runDispatcher(app);
                 redraw(app);
@@ -681,13 +745,21 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
         },
         xkb.XKB_KEY_Return => {
             if (app.candidates.len == 0) return;
-            const cand = app.candidates[app.input.selected];
-            if (cand.execute_fn) |exec| {
-                exec(cand) catch |err| {
-                    std.debug.print("execute failed: {}\n", .{err});
-                };
+            const tc = app.candidates[app.input.selected];
+            switch (tc.handler.on_enter) {
+                .close => app.running = false,
+                .run => |exec| {
+                    exec(tc.candidate.key orelse return) catch |err|
+                        std.debug.print("error: {}\n", .{err});
+                    app.running = false;
+                },
+                .show => |expand| {
+                    const text = expand(std.heap.page_allocator, tc.candidate.key orelse return) catch return;
+                    if (app.expanded) |old| std.heap.page_allocator.free(old);
+                    app.expanded = text;
+                    redraw(app);
+                },
             }
-            app.running = false;
         },
         else => {
             // Printable character: get UTF-8 bytes and insert at cursor.
@@ -699,6 +771,12 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             if (n_signed <= 0) return;
             const n: usize = @intCast(n_signed);
 
+            // TODO make it configurable. For now check Ctrl+Q as "close window" 
+            if (char_buf[0] == 0x11) {
+                app.running = false;
+                return;
+            }
+
             // Skip control characters: Ctrl+key produces C0 codes (< 0x20), DEL = 0x7F
             if (char_buf[0] < 0x20 or char_buf[0] == 0x7F) return;
 
@@ -707,17 +785,17 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
 
             // Shift bytes from cursor rightward to make room, then copy in new bytes.
             // copyBackwards: overlapping regions, destination is to the right of source.
-            std.mem.copyBackwards(u8,
-                app.input.buf[app.input.cursor + n .. app.input.len + n],
-                app.input.buf[app.input.cursor .. app.input.len]);
+            std.mem.copyBackwards(u8, app.input.buf[app.input.cursor + n .. app.input.len + n], app.input.buf[app.input.cursor..app.input.len]);
             @memcpy(app.input.buf[app.input.cursor .. app.input.cursor + n], char_buf[0..n]);
             app.input.len += n;
             app.input.cursor += n;
 
             // TODO improve this. This is a dictionary mode
-            if (app.mode == &default_mode and 
-                std.mem.eql(u8, app.input.buf[0..app.input.len], "dw ")) {
-                app.mode = &dict_mode;
+            if (app.mode == &default_mode and
+                std.mem.eql(u8, app.input.buf[0..app.input.len], "dw "))
+            {
+                loadMode(app, &dict_mode);
+                // TODO should we handle this in loadMode too?
                 app.input = .{};
             }
 
@@ -751,8 +829,54 @@ fn registryListener(registry: *wl.Registry, event: wl.Registry.Event, app: *App)
                 // capabilities event fires immediately telling us what's available.
                 app.seat = registry.bind(g.name, wl.Seat, 7) catch return;
                 app.seat.?.setListener(*App, seatListener, app);
+            } else if (std.mem.eql(u8, iface, "wl_output")) {
+                // version 2 is required for the .scale event
+                const out = registry.bind(g.name, wl.Output, 2) catch return;
+                for (&app.outputs) |*slot| {
+                    if (slot.* == null) {
+                        slot.* = .{ .output = out, .scale = 1 };
+                        out.setListener(*App, outputListener, app);
+                        break;
+                    }
+                }
             }
         },
         .global_remove => {},
+    }
+}
+
+// Fires once per output after binding (and again if the monitor changes)
+// We find the matching slot in app.outputs and update its scale
+fn outputListener(output: *wl.Output, event: wl.Output.Event, app: *App) void {
+    switch (event) {
+        .scale => |ev| {
+            for (&app.outputs) |*slot| {
+                if (slot.*) |*entry| {
+                    if (entry.output == output) {
+                        entry.scale = @intCast(ev.factor);
+                        break;
+                    }
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+// Fires when our surface enters or leaves an output.
+// On enter we look up the output's scale and store it in app.scale.
+fn surfaceListener(_: *wl.Surface, event: wl.Surface.Event, app: *App) void {
+    switch (event) {
+        .enter => |ev| {
+            for (app.outputs) |slot| {
+                if (slot) |entry| {
+                    if (entry.output == ev.output) {
+                        app.scale = entry.scale;
+                        break;
+                    }
+                }
+            }
+        },
+        else => {},
     }
 }

@@ -87,9 +87,7 @@ pub fn main() !void {
         if (std.mem.startsWith(u8, trimmed, "dw ")) {
             const query = trimmed[3..];
             const candidates = try dict.suggest(arena.allocator(), query);
-            if (candidates.len > 0 and candidates[0].sublabel != null) {
-                try stdout.print("{s}\n", .{candidates[0].sublabel.?});
-            } else if (candidates.len > 0) {
+            if (candidates.len > 0) {
                 try stdout.print("{s}\n", .{candidates[0].label});
             } else {
                 try stdout.print("No results for '{s}'\n", .{query});
@@ -111,15 +109,15 @@ pub fn main() !void {
             continue;
         }
 
-        // Try systemd command (exact match only in CLI)
-        candidates = try systemd.suggest(arena.allocator(), trimmed);
-        for (candidates) |cand| {
-            systemd.execute(cand) catch |err| {
+        // Try systemd command — load all, prefix-filter in CLI
+        const sys_candidates = try systemd.load(arena.allocator());
+        for (sys_candidates) |cand| {
+            if (!std.mem.startsWith(u8, cand.label, trimmed)) continue;
+            systemd.execute(cand.key orelse continue) catch |err| {
                 try stdout.print("Command failed: {}\n", .{err});
                 continue;
             };
             try stdout.print("{s}ing...\n", .{cand.label});
-            continue;
         }
 
         // Not a calculation or conversion — echo for now

@@ -7,6 +7,32 @@ var state = struct {
     dictionary: ?stardict.Dictionary = null,
 }{};
 
+pub const handler = h.Handler {
+    .name = "dict",
+    .kind = .dict,
+    .on_enter = .{ .show = expandEntry },
+    .source = .{ .suggest = suggest },
+};
+
+pub fn lookup(alloc: std.mem.Allocator, word: []const u8) ![]const u8 {
+    const d = state.dictionary orelse return error.NotLoaded;
+    // findByPrefix matches case-insensitively; an exact hit is one where the
+    // stored word has the same length as the query (prefix match already
+    // guarantees the same characters).
+    const matches = stardict.findByPrefix(d.entries, word);
+    for (matches) |entry| {
+        if (entry.word.len == word.len) {
+            const buf = try alloc.alloc(u8, entry.size);
+            return stardict.readDefinition(d.dict_file, entry, buf);
+        }
+    }
+    return error.NotFound;
+}
+
+fn expandEntry(alloc: std.mem.Allocator, key: []const u8) anyerror![]const u8 {
+    return lookup(alloc, key);
+}
+
 /// Return candidates for a dictionary query (the word/prefix to search).
 /// Lazy-loads the dictionary on first call. Returns empty slice on load failure.
 /// Caller is responsible for mode detection and prefix stripping.
@@ -14,6 +40,9 @@ pub fn suggest(allocator: std.mem.Allocator, query: []const u8) std.mem.Allocato
     if (!state.loaded) {
         // Mark loaded first — prevents infinite retry if the file is missing.
         state.loaded = true;
+        // TODO: scan ~/.stardict/dic/ for all subdirectories (like sdcv does) instead
+        // of hardcoding a single dictionary name. Also check /usr/share/stardict/dic/.
+        // Support ZENTO_DICT_DIR env var as an override.
         const home = std.posix.getenv("HOME") orelse "/tmp";
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const dir = std.fmt.bufPrint(&buf,
@@ -42,7 +71,7 @@ pub fn suggest(allocator: std.mem.Allocator, query: []const u8) std.mem.Allocato
     for (matches[0..count], 0..) |entry, i| {
         candidates[i] = .{
             .label = entry.word,
-            .kind = .preview,
+            .key = entry.word,
         };
     }
 
