@@ -9,6 +9,10 @@ const dispatcher = @import("dispatcher.zig");
 const PAD_H: i32 = 20; // horizontal padding: left margin for text, right margin for sublabels
 const ROW_PAD: i32 = 8; // vertical padding above and below text within each row
 
+const icon_raw = @embedFile("assets/zento-icon.raw");
+const ICON_RAW_SIZE: i32 = 96;  // pixel size of the embedded raw file
+const ICON_SIZE: i32 = 24;      // display size
+
 
 pub const DrawContext = struct {
     surface_image: *gfx.pixman_image_t,
@@ -123,6 +127,11 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
     const baseline: i32 = row_pad + ctx.font.*.ascent;
     const sep_y: i32 = row_h; // separator sits right below the input row
 
+    const icon_size: i32 = ICON_SIZE * ctx.scale;
+    const icon_margin: i32 = 8 * ctx.scale;
+    const footer_h: i32 = icon_size + icon_margin * 2;
+    const footer_sep_y: i32 = ctx.height - footer_h;
+
     // Colors
     const col_bg = gfx.pixman_color_t{ .red = 0x1818, .green = 0x1818, .blue = 0x2828, .alpha = 0xffff };
     const col_hl = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
@@ -143,12 +152,15 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
     // --- Separator ---
     drawRect(ctx.surface_image, 0, sep_y, @intCast(ctx.width), 1, col_sep);
 
+    // --- Footer separator ---
+    drawRect(ctx.surface_image, 0, footer_sep_y, @intCast(ctx.width), 1, col_sep);
+
     if (state.expanded) |text| {
         var lines = std.mem.splitScalar(u8, text, '\n');
         var row: usize = 0;
         while (lines.next()) |line| {
             const row_y = sep_y + 1 + @as(i32, @intCast(row)) * row_h;
-            if (row_y + row_h > ctx.height) break;
+            if (row_y + row_h > footer_sep_y) break;
             renderText(ctx.surface_image, ctx.font, line, pad_h, row_y + baseline, col_white);
             row += 1;
         }
@@ -156,6 +168,7 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
         for (state.candidates, 0..) |tc, i| {
             const row_y: i32 = sep_y + 1 + @as(i32, @intCast(i)) * row_h;
             const pen_y: i32 = row_y + baseline;
+            if (row_y + row_h > footer_sep_y) break;
 
             // Highlight the selected row with a full-width rectangle.
             if (i == state.selected) {
@@ -182,4 +195,40 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
             renderText(ctx.surface_image, ctx.font, kind_str, @as(i32, @intCast(ctx.width)) - pad_h - kind_w, pen_y, col_sub);
         }
     }
+
+    // --- Footer icon (right-aligned, vertically centered in footer strip) ---
+    const icon_img = gfx.pixman_image_create_bits(
+        gfx.PIXMAN_a8r8g8b8,
+        ICON_RAW_SIZE,
+        ICON_RAW_SIZE,
+        @constCast(@ptrCast(@alignCast(icon_raw.ptr))),
+        ICON_RAW_SIZE * 4,
+    ) orelse return;
+    defer _ = gfx.pixman_image_unref(icon_img);
+
+    // Scale down from raw size to display size (96 → 24, factor 4x)
+    const scale_factor: f64 = @as(f64, @floatFromInt(ICON_RAW_SIZE)) / @as(f64, @floatFromInt(icon_size));
+    const s: i32 = @intFromFloat(scale_factor * 65536.0);
+    var transform = gfx.pixman_transform_t{ .matrix = .{
+        .{ s, 0, 0 },
+        .{ 0, s, 0 },
+        .{ 0, 0, 65536 },
+    } };
+    _ = gfx.pixman_image_set_transform(icon_img, &transform);
+    _ = gfx.pixman_image_set_filter(icon_img, gfx.PIXMAN_FILTER_BILINEAR, null, 0);
+
+    const icon_x: i32 = ctx.width - icon_size - icon_margin;
+    const icon_y: i32 = footer_sep_y + icon_margin;
+
+    var alpha_color = gfx.pixman_color_t{ .red = 0, .green = 0, .blue = 0, .alpha = 0xdfff };
+    const alpha_mask = gfx.pixman_image_create_solid_fill(&alpha_color) orelse return;
+    defer _ = gfx.pixman_image_unref(alpha_mask);
+
+    gfx.pixman_image_composite32(
+        gfx.PIXMAN_OP_OVER,
+        icon_img, alpha_mask, ctx.surface_image,
+        0, 0, 0, 0,
+        icon_x, icon_y,
+        icon_size, icon_size,
+    );
 }
