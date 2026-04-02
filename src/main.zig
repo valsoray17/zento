@@ -18,14 +18,16 @@ pub fn main() !void {
     const stdout = &stdout_w.interface;
     defer stdout.flush() catch {};
 
-    // Dispatch to GUI mode if --gui flag is passed
+    // Default: launch GUI. Pass --cli for the text REPL.
     const args = try std.process.argsAlloc(std.heap.page_allocator);
     defer std.process.argsFree(std.heap.page_allocator, args);
+    var cli_mode = false;
     for (args[1..]) |arg| {
-        if (std.mem.eql(u8, arg, "--gui")) {
-            try wayland.run();
-            return;
-        }
+        if (std.mem.eql(u8, arg, "--cli")) cli_mode = true;
+    }
+    if (!cli_mode) {
+        try wayland.run();
+        return;
     }
 
     // Print welcome message

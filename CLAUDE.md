@@ -12,30 +12,39 @@ Background: Coming from Go.
 - When proposing architecture or memory management patterns, present ONE clear recommendation with rationale rather than a confused mix of approaches. If unsure, ask the user which ownership model they prefer before writing code.
 
 ## Current State
-- Basic REPL loop with stdin/stdout
+- Wayland UI: floating overlay window with input field + candidate list
 - Handler architecture: each plugin implements `suggest(allocator, input) → []Candidate`
   - `src/calc.zig` — calculator (+, -, *, /, %)
   - `src/convert.zig` — temperature (F↔C) and data units (B, KB, MB, GB, TB)
   - `src/dict.zig` — dictionary lookup via StarDict (`src/stardict.zig`)
   - `src/systemd.zig` — power commands via D-Bus (suggest + execute)
+  - `src/apps.zig` — app launcher via `.desktop` file scanning
   - `src/handler.zig` — shared types (Candidate, Handler, ResultKind)
-- Arena allocator for handler results, resets each input cycle
-- Quit command
+- `src/dispatcher.zig` — collects + ranks candidates from all handlers, owns arena + mode + selected
+- `src/render.zig` — pixman/fcft rendering (DrawContext + RenderState, no Wayland knowledge)
+- `src/wayland.zig` — Wayland event loop, keyboard input, calls dispatcher + render
+- `src/fuzzy.zig` — fuzzy scoring with consecutive run reward + word boundary bonus
+- Arena allocator for handler results, resets each keystroke
+- HiDPI support via `wl_surface.enter` scale detection + `setBufferScale`
+- Mode system: `dw ` triggers dict mode, Escape returns to default
 
 ## Next Steps
 - [x] **Handler refactor for partial input (UI-ready)**
-- [ ] **Wayland UI**
-- [ ] Application Launcher
-  - [ ] fuzzy finder support (fzf lib based ideally)
+- [x] **Wayland UI** (core working — see implementation plan below for remaining pieces)
+- [x] Application Launcher (`.desktop` file scanning, fuzzy match, exec)
 - [x] SystemD commands integration (suspend, shutdown etc.)
 - [x] Dictionary/define word (see Dictionary section below)
-- [ ] Remember frequently launched apps or commands (not the conversions/word definition)
+- [ ] **Key repeat** (timerfd + poll)
+- [ ] **Readline shortcuts** — Ctrl+A/E/U/K/W
+- [ ] **Frequency tracking** — remember frequently launched apps (see plan-frequency.md)
+- [ ] **Dict: scan all StarDict dirs** instead of hardcoded path (see plan-frequency.md TODO)
 - [ ] Unit conversions
   - [x] F to C (supports both "to" and "in" separators)
   - [x] Data units: B, KB, MB, GB, TB (e.g., `100 MB to KB`)
   - [ ] 50 Mb in 10 sec => 5 MB/sec (bandwidth calculation)
 - [ ] Timezone manipulation (i.e. current time in Tokyo or UTC time)
 - [ ] Support theming
+- [ ] Nested modes (see plan-modes.md)
 
 ## Zig Notes
 - Code includes Go-comparison comments for learning
@@ -207,12 +216,10 @@ code.
 interface. Since all handlers are known at compile time, the dispatcher can also call
 them directly. The struct exists for when we want to iterate over handlers in an array.
 
-### Open Questions
+### Design Decisions Made
 
-- **Handler identification on Candidate:** When the dispatcher merges candidates from
-  all handlers and the user selects one, how does the dispatcher know which handler's
-  `execute()` to call? Options: handler pointer on Candidate, execute fn pointer on
-  Candidate, or dispatcher tracks origin. Decide when building the dispatcher (step 6).
+- **Handler identification on Candidate:** `TaggedCandidate` in `dispatcher.zig` wraps
+  `Candidate` with a `*const Handler` pointer. On Enter, dispatcher calls `handler.on_enter`.
 
 ### Candidate Structure
 
@@ -263,8 +270,8 @@ const Handler = struct {
 3. [x] Refactor calculator → `suggest()` returns 0-1 candidates
 4. [x] Refactor converters → `suggest()` returns 0-1 candidates
 5. [x] Refactor dictionary → `suggest()` uses existing `findByPrefix()`
-6. [ ] Create dispatcher: call all handlers, merge candidates by score
-7. [ ] Update main.zig REPL to use new dispatcher (keep CLI working)
+6. [x] Create dispatcher: call all handlers, merge candidates by score
+7. [x] Update main.zig REPL to use new dispatcher (keep CLI working)
 
 ## Wayland UI
 
@@ -376,7 +383,7 @@ glyphs (emoji), use glyph->pix as source directly. Positioning formula:
        surface, set up wl_shm buffer pool (mmap), fill with solid color via pixman, commit
 3. [x] **Text rendering:** Install fcft-devel, link fcft + pixman, init fcft, load font,
        render static text onto the pixman surface
-4. [ ] **Keyboard input:** Bind wl_seat, set up keyboard listener, xkbcommon keycode
+4. [x] **Keyboard input:** Bind wl_seat, set up keyboard listener, xkbcommon keycode
        translation, build text input buffer, handle backspace/escape/enter
        - [x] Piece 1: wl_seat + wl_keyboard listeners, Escape to close
        - [x] Piece 2: xkbcommon keymap + xkb_state, translate keys to U+XXXX
@@ -384,12 +391,11 @@ glyphs (emoji), use glyph->pix as source directly. Positioning formula:
        - [ ] Piece 4: key repeat (timerfd + poll on Wayland fd + timerfd)
        - [ ] Piece 5: readline shortcuts — Ctrl+A (home), Ctrl+E (end), Ctrl+U (kill to start),
              Ctrl+K (kill to end), Ctrl+W (delete word back)
-5. [ ] **Candidate list:** Layout input field + candidate rows, render labels + sublabels,
+5. [x] **Candidate list:** Layout input field + candidate rows, render labels + sublabels,
        arrow key navigation with highlight
-6. [ ] **Wire to handlers:** On keystroke → reset arena, call all handlers, collect
+6. [x] **Wire to handlers:** On keystroke → reset arena, call all handlers, collect
        candidates, sort by score, render list. Enter → execute. Escape → close
-7. [ ] **Mode system:** Handler-set switching via keyword triggers ("dw " → dict mode).
-       See plan-modes.md.
+7. [x] **Mode system:** Handler-set switching via keyword triggers ("dw " → dict mode).
 8. [ ] **Nested modes:** Mode hierarchy with a mode stack — e.g. "dd " → top level shows
        categories (dashboards / monitors / apm), selecting one enters a single-handler
        sub-mode. Escape pops the stack. See plan-modes.md future section.

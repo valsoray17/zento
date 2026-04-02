@@ -3,65 +3,32 @@ const std = @import("std");
 const wl = @import("wayland").client.wl;
 const zwlr = @import("wayland").client.zwlr;
 
-const calc = @import("calc.zig");
-const convert = @import("convert.zig");
-const dict = @import("dict.zig");
-const fuzzy = @import("fuzzy.zig");
-const handler = @import("handler.zig");
-const systemd = @import("systemd.zig");
-const apps = @import("apps.zig");
+const render = @import("render.zig");
+const gfx = render.gfx; // reuse rener's cImport
+const dispatcher = @import("dispatcher.zig");
 
-const gfx = @cImport({
-    @cInclude("pixman-1/pixman.h");
-    @cInclude("fcft/fcft.h");
-});
 const xkb = @cImport(@cInclude("xkbcommon/xkbcommon.h"));
+
+const WIDTH = 600;
+const HEIGHT = 400;
+
+// Input state
+// Text input buffer — accumulates keypresses as UTF-8 bytes.
+// cursor is a byte offset into input_buf (not a codepoint index).
+// A 4-byte emoji at the start means cursor_byte=4, not cursor_byte=1.
+const InputState = struct {
+    buf: [512]u8 = undefined,
+    len: usize = 0,
+    cursor: usize = 0,
+};
+
+const OutputEntry = struct { output: *wl.Output, scale: i32 };
 
 // Application state — passed as context pointer to every Wayland listener.
 // All compositor-side objects we own live here so listeners can reach them.
 //
 // Go analogy: a struct holding all the net.Conn, channels, and shared state
 // for a long-running client — passed around instead of using globals.
-const WIDTH: u32 = 600;
-const HEIGHT: u32 = 400;
-const PAD_H: i32 = 20; // horizontal padding: left margin for text, right margin for sublabels
-const ROW_PAD: i32 = 8; // vertical padding above and below text within each row
-
-// Modes
-const Mode = struct {
-    prefix: []const u8,
-    handlers: []const *const handler.Handler,
-};
-
-const default_mode = Mode{
-    .prefix = "> ",
-    .handlers = &.{ &calc.handler, &convert.handler, &systemd.handler, &apps.handler },
-};
-
-const dict_mode = Mode{
-    .prefix = "[dict] ",
-    // potentially can merge multiple dictionaries in the future
-    .handlers = &.{&dict.handler},
-};
-
-// Input state
-// Text input buffer — accumulates keypresses as UTF-8 bytes.
-// cursor_byte is a byte offset into input_buf (not a codepoint index).
-// A 4-byte emoji at the start means cursor_byte=4, not cursor_byte=1.
-const InputState = struct {
-    buf: [512]u8 = undefined,
-    len: usize = 0,
-    cursor: usize = 0,
-    selected: usize = 0,
-};
-
-const TaggedCandidate = struct {
-    candidate: handler.Candidate,
-    handler: *const handler.Handler,
-};
-
-const OutputEntry = struct { output: *wl.Output, scale: u32 };
-
 const App = struct {
     // Globals: one per interface the compositor advertises in the registry.
     // We bind each one during the first roundtrip.
@@ -78,7 +45,6 @@ const App = struct {
     // Output scale tracking — see OutputEntry above App.
     // Defaults to 1 until wl_surface.enter fires and tells us the real output.
     outputs: [8]?OutputEntry = [_]?OutputEntry{null} ** 8,
-    scale: u32 = 1,
 
     // xkbcommon state — populated when compositor sends the keymap event.
     // context: global xkb context (needed to create keymaps)
@@ -92,9 +58,7 @@ const App = struct {
     // Listeners only receive *App, so we store these here rather than
     // passing them through every call path.
     surface: ?*wl.Surface = null,
-    surface_image: ?*gfx.pixman_image_t = null,
     wl_buffer: ?*wl.Buffer = null,
-    font: ?*gfx.struct_fcft_font = null,
 
     // Set to true when compositor sends its first configure event.
     // We must not attach a buffer before that — protocol violation.
@@ -103,11 +67,11 @@ const App = struct {
 
     input: InputState = .{},
 
-    // These are the things required for the actual app logic
-    arena: ?*std.heap.ArenaAllocator = null,
-    mode: *const Mode = &default_mode,
-    static_candidates: []TaggedCandidate = &.{},
-    candidates: []TaggedCandidate = &.{},
+    dispatch: ?dispatcher.DispatcherState = null,
+
+    scale: i32 = 1,
+    font: ?*gfx.struct_fcft_font = null,
+    surface_image: ?*gfx.pixman_image_t = null,
     expanded: ?[]const u8 = null,
 };
 
@@ -235,10 +199,10 @@ pub fn run() !void {
     //   Better than shm_open: no name, no /dev/shm file to clean up on crash.
     //   w
     //   Lives in RAM, behaves like a regular file (ftruncate, mmap, etc).
-    const physical_w: u32 = WIDTH * app.scale;
-    const physical_h: u32 = HEIGHT * app.scale;
-    const stride: u32 = physical_w * 4; // 4 bytes per pixel: [A][R][G][B]
-    const size: usize = stride * physical_h;
+    const physical_w: i32 = WIDTH * app.scale;
+    const physical_h: i32 = HEIGHT * app.scale;
+    const stride: i32 = physical_w * 4; // 4 bytes per pixel: [A][R][G][B]
+    const size: usize = @intCast(stride * physical_h);
 
     const fd = try std.posix.memfd_create("zento-shm", 0);
     defer std.posix.close(fd);
@@ -301,10 +265,10 @@ pub fn run() !void {
 
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    app.arena = &arena;
 
-    loadMode(&app, &default_mode);
-    runDispatcher(&app);
+    app.dispatch = dispatcher.DispatcherState{ .arena = &arena };
+    dispatcher.loadMode(&app.dispatch.?, &dispatcher.default_mode);
+    dispatcher.run(&app.dispatch.?, app.input.buf[0..app.input.len]);
     redraw(&app);
 
     std.debug.print("Window open. Press Escape to close.\n", .{});
@@ -313,251 +277,31 @@ pub fn run() !void {
     }
 }
 
-fn loadMode(app: *App, mode: *const Mode) void {
-    std.heap.page_allocator.free(app.static_candidates);
-    app.mode = mode;
-
-    var candidates: std.ArrayListUnmanaged(TaggedCandidate) = .empty;
-    for (app.mode.handlers) |h| {
-        switch (h.source) {
-            .load => |f| for (f(std.heap.page_allocator) catch continue) |cand|
-                candidates.append(std.heap.page_allocator, .{ .candidate = cand, .handler = h }) catch continue,
-            .suggest => {},
-        }
-    }
-
-    app.static_candidates = candidates.toOwnedSlice(std.heap.page_allocator) catch &.{};
-}
-
-// Collect candidates from all handlers for the current input.
-// Resets the arena first — previous candidates are invalidated.
-// Called after every input change (insert, backspace, delete).
-fn runDispatcher(app: *App) void {
-    const arena = app.arena orelse return;
-    // frees all allocations locally but keeps the backing memory pages mapped
-    _ = arena.reset(.retain_capacity);
-    const alloc = arena.allocator();
-
-    const input = app.input.buf[0..app.input.len];
-
-    // Collect candidates
-    var all: std.ArrayListUnmanaged(TaggedCandidate) = .empty;
-    // static hadlers
-    all.appendSlice(alloc, app.static_candidates) catch {};
-    // dynamic handlers
-    for (app.mode.handlers) |h| {
-        if (input.len == 0) break;
-        switch (h.source) {
-            .suggest => |f| for (f(alloc, input) catch continue) |cand|
-                all.append(alloc, .{ .candidate = cand, .handler = h }) catch continue,
-            .load => {},
-        }
-    }
-
-    // Score
-    const Ranked = struct { tagged: TaggedCandidate, score: f32 };
-    var ranked: std.ArrayListUnmanaged(Ranked) = .empty;
-    for (all.items) |tc| {
-        const s: f32 = if (tc.handler.kind == .calc) 1.0 else fuzzy.score(input, tc.candidate.label);
-        if (s > 0) ranked.append(alloc, .{ .tagged = tc, .score = s }) catch continue;
-    }
-
-    // Sort — .calc first, then by score
-    // Explicit kind priority is needed because fuzzy scores can exceed 1.0.
-    std.mem.sort(Ranked, ranked.items, {}, struct {
-        fn gt(_: void, a: Ranked, b: Ranked) bool {
-            const a_calc = a.tagged.handler.kind == .calc;
-            const b_calc = b.tagged.handler.kind == .calc;
-            if (a_calc != b_calc) return a_calc;
-            return a.score > b.score;
-        }
-    }.gt);
-
-    // Strip scores - store ordered TaggedCandidate only
-    // TODO: derive max rows from window height / row_h instead of hardcoding 8
-    const top = ranked.items[0..@min(ranked.items.len, 8)];
-    const out = alloc.alloc(TaggedCandidate, top.len) catch {
-        app.candidates = &.{};
-        return;
-    };
-    for (top, 0..) |r, i| out[i] = r.tagged;
-    app.candidates = out;
-
-    if (app.candidates.len == 0) {
-        app.input.selected = 0;
-    } else if (app.input.selected >= app.candidates.len) {
-        app.input.selected = app.candidates.len - 1;
-    }
-}
-
-// Redraw the window: clear + layout + commit to compositor.
-// Called after every keystroke or selection change.
 fn redraw(app: *App) void {
-    // TODO scale changes at runtime should also recreate buffer
+    const ctx = render.DrawContext{
+        .surface_image = app.surface_image orelse return,
+        .font = app.font orelse return,
+        .scale = app.scale,
+        .width = @as(i32, @intCast(WIDTH)) * app.scale,
+        .height = @as(i32, @intCast(HEIGHT)) * app.scale,
+    };
+
+    const d = &(app.dispatch orelse return);
+    render.redraw(ctx, render.RenderState{
+        .prefix = d.mode.prefix,
+        .input = app.input.buf[0..app.input.len],
+        .expanded = app.expanded,
+        .candidates = d.candidates,
+        .selected = d.selected,
+    });
+
     const surface = app.surface orelse return;
-    const image = app.surface_image orelse return;
     const buffer = app.wl_buffer orelse return;
-    const font = app.font orelse return;
-
-    // TODO move scaled dimensions (w, h, pad, row) into App so they are
-    // computed once on scale
-    const scale: i32 = @intCast(app.scale);
-    const w: i32 = @as(i32, @intCast(WIDTH)) * scale;
-    const h: i32 = @as(i32, @intCast(HEIGHT)) * scale;
-    const pad_h: i32 = PAD_H * scale;
-    const row_pad: i32 = ROW_PAD * scale;
-
-    // Layout metrics derived from font at runtime.
-    // row_h is the same for the input row and every candidate row.
-    // baseline is the pen_y offset within any row.
-    const font_height: i32 = font.*.height;
-    const row_h: i32 = font_height + row_pad * 2;
-    const baseline: i32 = row_pad + font.*.ascent;
-    const sep_y: i32 = row_h; // separator sits right below the input row
-
-    // Colors
-    const col_bg = gfx.pixman_color_t{ .red = 0x1818, .green = 0x1818, .blue = 0x2828, .alpha = 0xffff };
-    const col_hl = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
-    const col_sep = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
-    const col_white = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
-    const col_prefix = gfx.pixman_color_t{ .red = 0x6666, .green = 0x6666, .blue = 0x8888, .alpha = 0xffff };
-    const col_sub = gfx.pixman_color_t{ .red = 0x7777, .green = 0x7777, .blue = 0x9999, .alpha = 0xffff };
-
-    // --- Background ---
-    drawRect(image, 0, 0, @intCast(w), @intCast(h), col_bg);
-
-    // --- Input row ---
-    // "> " prefix in muted color, then the typed text in white.
-    const prefix = app.mode.prefix;
-    renderText(image, font, prefix, pad_h, baseline, col_prefix);
-    const prefix_w = measureText(font, prefix);
-    renderText(image, font, app.input.buf[0..app.input.len], pad_h + prefix_w, baseline, col_white);
-
-    // --- Separator ---
-    drawRect(image, 0, sep_y, @intCast(w), 1, col_sep);
-
-    if (app.expanded) |text| {
-        var lines = std.mem.splitScalar(u8, text, '\n');
-        var row: usize = 0;
-        while (lines.next()) |line| {
-            const row_y = sep_y + 1 + @as(i32, @intCast(row)) * row_h;
-            if (row_y + row_h > @as(i32, h)) break;
-            renderText(image, font, line, pad_h, row_y + baseline, col_white);
-            row += 1;
-        }
-    } else {
-        for (app.candidates, 0..) |tc, i| {
-            const row_y: i32 = sep_y + 1 + @as(i32, @intCast(i)) * row_h;
-            const pen_y: i32 = row_y + baseline;
-
-            // Highlight the selected row with a full-width rectangle.
-            if (i == app.input.selected) {
-                drawRect(image, 0, row_y, @intCast(w), row_h, col_hl);
-            }
-
-            // Label — left-aligned with horizontal padding.
-            renderText(image, font, tc.candidate.label, pad_h, pen_y, col_white);
-
-            // Sublabel - inline after label, dimmer color
-            if (tc.candidate.sublabel) |sub| {
-                const label_w = measureText(font, tc.candidate.label);
-                renderText(image, font, sub, pad_h + label_w + 8, pen_y, col_sub);
-            }
-
-            // Kind tag - right aligned
-            const kind_str: []const u8 = switch (tc.handler.kind) {
-                .calc => "calc",
-                .cmd => "command",
-                .app => "application",
-                .dict => "dictionary",
-            };
-            const kind_w = measureText(font, kind_str);
-            renderText(image, font, kind_str, @as(i32, @intCast(w)) - pad_h - kind_w, pen_y, col_sub);
-        }
-    }
-
-    surface.setBufferScale(scale);
+    // TODO again: why is this cast? Can we use the same int type expected?
+    surface.setBufferScale(app.scale);
     surface.attach(buffer, 0, 0);
     surface.damageBuffer(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
     surface.commit();
-}
-
-// Measure the pixel width of a UTF-8 string by summing glyph advances.
-// Used to right-align sublabels: pen_x = WIDTH - PAD_H - measureText(font, text)
-fn measureText(font: *gfx.struct_fcft_font, text: []const u8) i32 {
-    var width: i32 = 0;
-    var iter = std.unicode.Utf8View.init(text) catch return 0;
-    var it = iter.iterator();
-    while (it.nextCodepoint()) |cp| {
-        const glyph = gfx.fcft_rasterize_char_utf32(font, cp, gfx.FCFT_SUBPIXEL_DEFAULT) orelse continue;
-        width += glyph.*.advance.x;
-    }
-    return width;
-}
-
-// Draw a filled rectangle at (x, y) with given width, height and color.
-// Used for the separator line (h=1) and candidate highlight (h=row_h).
-fn drawRect(image: *gfx.pixman_image_t, x: i32, y: i32, w: i32, h: i32, color: gfx.pixman_color_t) void {
-    var c = color;
-    var rect = gfx.pixman_rectangle16_t{
-        .x = @intCast(x),
-        .y = @intCast(y),
-        .width = @intCast(w),
-        .height = @intCast(h),
-    };
-    _ = gfx.pixman_image_fill_rectangles(gfx.PIXMAN_OP_SRC, image, &c, 1, &rect);
-}
-
-// Render a UTF-8 string onto a pixman surface image.
-//
-// pen_x/pen_y: starting position. pen_y is the baseline —
-//   glyphs sit above it (ascent) and hang below it (descent).
-//
-// Rendering pipeline per glyph:
-//   1. fcft rasterizes the codepoint → pixman_image_t (the glyph bitmap)
-//   2. For normal glyphs: composite glyph as a mask over a solid color
-//      (PIXMAN_OP_OVER blends glyph alpha with the destination)
-//   3. Advance pen_x by glyph->advance.x for the next character
-fn renderText(
-    dst: *gfx.pixman_image_t,
-    font: *gfx.struct_fcft_font,
-    text: []const u8,
-    pen_x: i32,
-    pen_y: i32,
-    color: gfx.pixman_color_t,
-) void {
-    // Solid fill image for the text color — used as the source in compositing.
-    // pixman_image_create_solid_fill: a virtual infinite image of one color.
-    var mutable_color = color;
-    const src = gfx.pixman_image_create_solid_fill(&mutable_color) orelse return;
-    defer _ = gfx.pixman_image_unref(src);
-
-    var x = pen_x;
-
-    // Iterate the UTF-8 string codepoint by codepoint.
-    // std.unicode.Utf8View handles multi-byte sequences correctly.
-    var iter = std.unicode.Utf8View.init(text) catch return;
-    var it = iter.iterator();
-    while (it.nextCodepoint()) |cp| {
-        // Rasterize one character. fcft caches rasterized glyphs internally
-        // so repeated calls for the same codepoint are fast.
-        const glyph = gfx.fcft_rasterize_char_utf32(font, cp, gfx.FCFT_SUBPIXEL_DEFAULT) orelse continue;
-
-        // glyph->x/y: offset from pen point to top-left of the glyph bitmap.
-        // y is measured upward from baseline, so we subtract it.
-        const dst_x = x + glyph.*.x;
-        const dst_y = pen_y - glyph.*.y;
-
-        if (glyph.*.is_color_glyph) {
-            // Emoji: glyph->pix is already full ARGB — use as source directly.
-            gfx.pixman_image_composite32(gfx.PIXMAN_OP_OVER, glyph.*.pix, null, dst, 0, 0, 0, 0, dst_x, dst_y, glyph.*.width, glyph.*.height);
-        } else {
-            // Normal glyph: pix is a grayscale mask — composite solid color through it.
-            gfx.pixman_image_composite32(gfx.PIXMAN_OP_OVER, src, glyph.*.pix, dst, 0, 0, 0, 0, dst_x, dst_y, glyph.*.width, glyph.*.height);
-        }
-
-        x += glyph.*.advance.x;
-    }
 }
 
 // Compositor response to our surface.commit().
@@ -663,6 +407,8 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, app: *App) void {
 fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
     if (state != .pressed) return;
 
+    const d = &(app.dispatch orelse return);
+
     // Escape: raw keycode check, no xkb needed
     if (key == 1) {
         if (app.expanded != null) {
@@ -670,14 +416,14 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             std.heap.page_allocator.free(app.expanded.?);
             app.expanded = null;
             redraw(app);
-        } else if (app.mode == &default_mode) {
+        } else if (d.mode == &dispatcher.default_mode) {
             // in default mode, close the app
             app.running = false;
         } else {
             // we are one level into another mode
-            loadMode(app, &default_mode);
+            dispatcher.loadMode(d, &dispatcher.default_mode);
             app.input = .{};
-            runDispatcher(app);
+            dispatcher.run(d, app.input.buf[0..app.input.len]);
             redraw(app);
         }
         return;
@@ -700,7 +446,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                 std.mem.copyForwards(u8, app.input.buf[start .. app.input.len - removed], app.input.buf[app.input.cursor..app.input.len]);
                 app.input.len -= removed;
                 app.input.cursor = start;
-                runDispatcher(app);
+                dispatcher.run(d, app.input.buf[0..app.input.len]);
                 redraw(app);
             }
         },
@@ -712,7 +458,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                 const removed = end - app.input.cursor;
                 std.mem.copyForwards(u8, app.input.buf[app.input.cursor .. app.input.len - removed], app.input.buf[end..app.input.len]);
                 app.input.len -= removed;
-                runDispatcher(app);
+                dispatcher.run(d, app.input.buf[0..app.input.len]);
                 redraw(app);
             }
         },
@@ -732,20 +478,21 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             }
         },
         xkb.XKB_KEY_Up => {
-            if (app.input.selected > 0) {
-                app.input.selected -= 1;
+            if (d.selected > 0) {
+                d.selected -= 1;
                 redraw(app);
             }
         },
         xkb.XKB_KEY_Down => {
-            if (app.candidates.len > 0 and app.input.selected < app.candidates.len - 1) {
-                app.input.selected += 1;
+            // TODO way too many of .?. things. Is there another option for this?
+            if (d.candidates.len > 0 and d.selected < d.candidates.len - 1) {
+                d.selected += 1;
                 redraw(app);
             }
         },
         xkb.XKB_KEY_Return => {
-            if (app.candidates.len == 0) return;
-            const tc = app.candidates[app.input.selected];
+            if (d.candidates.len == 0) return;
+            const tc = d.candidates[d.selected];
             switch (tc.handler.on_enter) {
                 .close => app.running = false,
                 .run => |exec| {
@@ -791,15 +538,15 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             app.input.cursor += n;
 
             // TODO improve this. This is a dictionary mode
-            if (app.mode == &default_mode and
+            if (d.mode == &dispatcher.default_mode and
                 std.mem.eql(u8, app.input.buf[0..app.input.len], "dw "))
             {
-                loadMode(app, &dict_mode);
+                dispatcher.loadMode(d, &dispatcher.dict_mode);
                 // TODO should we handle this in loadMode too?
                 app.input = .{};
             }
 
-            runDispatcher(app);
+            dispatcher.run(d, app.input.buf[0..app.input.len]);
             redraw(app);
         },
     }
@@ -853,7 +600,7 @@ fn outputListener(output: *wl.Output, event: wl.Output.Event, app: *App) void {
             for (&app.outputs) |*slot| {
                 if (slot.*) |*entry| {
                     if (entry.output == output) {
-                        entry.scale = @intCast(ev.factor);
+                        entry.scale = ev.factor;
                         break;
                     }
                 }
