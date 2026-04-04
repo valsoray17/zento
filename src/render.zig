@@ -96,6 +96,23 @@ fn renderText(
     }
 }
 
+// Returns the byte length of the longest prefix of `text` that fits within
+// max_w, or null if the full text fits. Caller subtracts ellipsis width from
+// max_w before calling so this function has no knowledge of ellipsis.
+fn truncateText(font: *gfx.struct_fcft_font, text: []const u8, max_w: i32) ?usize {
+    var w: i32 = 0;
+    var fit_byte: usize = 0;
+    var iter = std.unicode.Utf8View.init(text) catch return null;
+    var it = iter.iterator();
+    while (it.nextCodepoint()) |cp| {
+        const glyph = gfx.fcft_rasterize_char_utf32(font, cp, gfx.FCFT_SUBPIXEL_DEFAULT) orelse continue;
+        w += glyph.*.advance.x;
+        if (w > max_w) return fit_byte;
+        fit_byte = it.i;
+    }
+    return null;
+}
+
 // Measure the pixel width of a UTF-8 string by summing glyph advances.
 // Used to right-align sublabels: pen_x = WIDTH - PAD_H - measureText(font, text)
 fn measureText(font: *gfx.struct_fcft_font, text: []const u8) i32 {
@@ -178,21 +195,34 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
             // Label — left-aligned with horizontal padding.
             renderText(ctx.surface_image, ctx.font, tc.candidate.label, pad_h, pen_y, col_white);
 
-            // Sublabel - inline after label, dimmer color
-            if (tc.candidate.sublabel) |sub| {
-                const label_w = measureText(ctx.font, tc.candidate.label);
-                renderText(ctx.surface_image, ctx.font, sub, pad_h + label_w + 8, pen_y, col_sub);
-            }
-
             // Kind tag - right aligned
             const kind_str: []const u8 = switch (tc.handler.kind) {
-                .calc => "calc",
-                .cmd => "command",
-                .app => "application",
-                .dict => "dictionary",
+                .calc => "[calc]",
+                .cmd => "[cmd]",
+                .app => "[app]",
+                .dict => "[dict]",
             };
             const kind_w = measureText(ctx.font, kind_str);
-            renderText(ctx.surface_image, ctx.font, kind_str, @as(i32, @intCast(ctx.width)) - pad_h - kind_w, pen_y, col_sub);
+            const kind_x: i32 = @as(i32, @intCast(ctx.width)) - pad_h - kind_w;
+            renderText(ctx.surface_image, ctx.font, kind_str, kind_x, pen_y, col_sub);
+
+            // Sublabel - inline after label, truncated with ellipsis if it would overlap kind tag
+            if (tc.candidate.sublabel) |sub| {
+                const label_w = measureText(ctx.font, tc.candidate.label);
+                const dot_x = pad_h + label_w + 8;
+                const dot_w = measureText(ctx.font, "·");
+                const sub_x = dot_x + dot_w + 8;
+                const ellipsis_w = measureText(ctx.font, "…");
+                const sub_max_w = kind_x - sub_x - pad_h - ellipsis_w;
+                renderText(ctx.surface_image, ctx.font, "·", dot_x, pen_y, col_sep);
+                if (truncateText(ctx.font, sub, sub_max_w)) |len| {
+                    renderText(ctx.surface_image, ctx.font, sub[0..len], sub_x, pen_y, col_sub);
+                    const truncated_w = measureText(ctx.font, sub[0..len]);
+                    renderText(ctx.surface_image, ctx.font, "…", sub_x + truncated_w, pen_y, col_sub);
+                } else {
+                    renderText(ctx.surface_image, ctx.font, sub, sub_x, pen_y, col_sub);
+                }
+            }
         }
     }
 

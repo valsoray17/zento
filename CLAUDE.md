@@ -44,7 +44,6 @@ Background: Coming from Go.
   - [ ] 50 Mb in 10 sec => 5 MB/sec (bandwidth calculation)
 - [ ] Timezone manipulation (i.e. current time in Tokyo or UTC time)
 - [ ] Support theming
-- [ ] Nested modes (see plan-modes.md)
 
 ## Zig Notes
 - Code includes Go-comparison comments for learning
@@ -396,9 +395,6 @@ glyphs (emoji), use glyph->pix as source directly. Positioning formula:
 6. [x] **Wire to handlers:** On keystroke → reset arena, call all handlers, collect
        candidates, sort by score, render list. Enter → execute. Escape → close
 7. [x] **Mode system:** Handler-set switching via keyword triggers ("dw " → dict mode).
-8. [ ] **Nested modes:** Mode hierarchy with a mode stack — e.g. "dd " → top level shows
-       categories (dashboards / monitors / apm), selecting one enters a single-handler
-       sub-mode. Escape pops the stack. See plan-modes.md future section.
 
 ### Text Input Buffer Design (Step 4 Piece 3)
 

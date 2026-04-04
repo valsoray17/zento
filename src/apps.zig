@@ -3,11 +3,13 @@ const h = @import("handler.zig");
 
 const AppEntry = struct {
     name: []const u8,
+    comment: []const u8,
     exec: []const u8,
 };
 
 const NAME     = "Name=";
 const EXEC     = "Exec=";
+const COMMENT  = "Comment=";
 const TYPE     = "Type=";
 const TERMINAL = "Terminal=";
 const NO_DISPLAY = "NoDisplay=";
@@ -55,6 +57,7 @@ fn parseDesktopFile(alloc: std.mem.Allocator, dir: std.fs.Dir, file_name: []cons
 
     var lines = std.mem.splitScalar(u8, contents, '\n');
     var name: ?[]const u8 = null;
+    var comment: ?[]const u8 = null;
     var exec: ?[]const u8 = null;
     var is_app = false;
     var terminal = false;
@@ -75,7 +78,8 @@ fn parseDesktopFile(alloc: std.mem.Allocator, dir: std.fs.Dir, file_name: []cons
         if (std.mem.startsWith(u8, line, "[")) break;
 
         if (std.mem.startsWith(u8, line, NAME))       name       = line[NAME.len..];
-        if (std.mem.startsWith(u8, line, EXEC))       exec       = line[EXEC.len..]; // TODO strip the params like %u etc.
+        if (std.mem.startsWith(u8, line, COMMENT))    comment    = line[COMMENT.len..];
+        if (std.mem.startsWith(u8, line, EXEC))       exec       = line[EXEC.len..];
         if (std.mem.startsWith(u8, line, TYPE))       is_app     = std.mem.eql(u8, line[TYPE.len..], "Application");
         if (std.mem.startsWith(u8, line, TERMINAL))   terminal   = std.mem.eql(u8, line[TERMINAL.len..], "true");
         if (std.mem.startsWith(u8, line, NO_DISPLAY)) no_display = std.mem.eql(u8, line[NO_DISPLAY.len..], "true");
@@ -83,10 +87,11 @@ fn parseDesktopFile(alloc: std.mem.Allocator, dir: std.fs.Dir, file_name: []cons
 
     // validate
     const n = name orelse return null;
+    const c = comment orelse "";
     const e = exec orelse return null;
     if (!is_app or terminal or no_display) return null;
 
-    // strip the params like %u etc.
+    // strip the params like %u etc. from exec
     var exec_stripped: [1024]u8 = undefined;
     var out_len: usize = 0;
     var i: usize = 0;
@@ -107,9 +112,10 @@ fn parseDesktopFile(alloc: std.mem.Allocator, dir: std.fs.Dir, file_name: []cons
     }
     
     const name_owned = alloc.dupe(u8, n) catch return null;
+    const comment_owned = alloc.dupe(u8, c) catch return null;
     const exec_owned = alloc.dupe(u8, exec_stripped[0..out_len]) catch return null;
 
-    return .{ .name = name_owned, .exec = exec_owned };
+    return .{ .name = name_owned, .comment = comment_owned, .exec = exec_owned };
 }
 
 pub const handler = h.Handler {
@@ -137,6 +143,7 @@ pub fn load(alloc: std.mem.Allocator) std.mem.Allocator.Error![]h.Candidate {
     for (state.entries, 0..) |entry, i| {
        candidates[i] = .{
           .label = entry.name,
+          .sublabel = entry.comment,
           .key = entry.exec,
        };
     }
