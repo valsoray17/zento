@@ -36,7 +36,6 @@ pub const DispatcherState = struct {
     mode: *const Mode = &default_mode,
     static_candidates: []TaggedCandidate = &.{},
     candidates: []TaggedCandidate = &.{},
-    selected: usize = 0,
 };
 
 // TODO consider moving run and loadMode to the dispatcher state struct as methods
@@ -83,8 +82,7 @@ pub fn run(state: *DispatcherState, input: []const u8) void {
     }.gt);
 
     // Strip scores - store ordered TaggedCandidate only
-    // TODO: derive max rows from window height / row_h instead of hardcoding 8
-    const top = ranked.items[0..@min(ranked.items.len, 8)];
+    const top = ranked.items;
     const out = alloc.alloc(TaggedCandidate, top.len) catch {
         state.candidates = &.{};
         return;
@@ -92,11 +90,6 @@ pub fn run(state: *DispatcherState, input: []const u8) void {
     for (top, 0..) |r, i| out[i] = r.tagged;
     state.candidates = out;
 
-    if (state.candidates.len == 0) {
-        state.selected = 0;
-    } else if (state.selected >= state.candidates.len) {
-        state.selected = state.candidates.len - 1;
-    }
 }
 
 pub fn loadMode(state: *DispatcherState, mode: *const Mode) void {

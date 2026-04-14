@@ -32,8 +32,8 @@ const TempUnit = enum {
 
     fn toStr(self: TempUnit) []const u8 {
         return switch (self) {
-            .celsius => "C",
-            .fahrenheit => "F",
+            .celsius => "C°",
+            .fahrenheit => "F°",
         };
     }
 };
@@ -197,7 +197,7 @@ pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocato
 
     candidates[0] = .{
         .label = label,
-        .sublabel = null,
+        .sublabel = "test", // TODO remove this later
     };
     return candidates[0..1];
 }

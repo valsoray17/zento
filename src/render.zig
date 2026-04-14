@@ -7,16 +7,18 @@ pub const gfx = @cImport({
 const dispatcher = @import("dispatcher.zig");
 
 const PAD_H: i32 = 20; // horizontal padding: left margin for text, right margin for sublabels
-const ROW_PAD: i32 = 8; // vertical padding above and below text within each row
+pub const ROW_PAD: i32 = 6;  // vertical padding above and below text within each row
+pub const ICON_SIZE: i32 = 24;      // display size
+pub const ICON_MARGIN: i32 = 2;     // gap between footer separator and icon
 
 const icon_raw = @embedFile("assets/zento-icon.raw");
 const ICON_RAW_SIZE: i32 = 96;  // pixel size of the embedded raw file
-const ICON_SIZE: i32 = 24;      // display size
 
 
 pub const DrawContext = struct {
     surface_image: *gfx.pixman_image_t,
     font: *gfx.struct_fcft_font,
+    font_large: *gfx.struct_fcft_font,
 
     scale: i32 = 1,
     width: i32,
@@ -29,6 +31,8 @@ pub const RenderState = struct {
     expanded: ?[]const u8,
     candidates: []dispatcher.TaggedCandidate,
     selected: usize,
+    scroll_offset: usize,
+    expanded_scroll: usize,
 };
 
 // Draw a filled rectangle at (x, y) with given width, height and color.
@@ -126,6 +130,55 @@ fn measureText(font: *gfx.struct_fcft_font, text: []const u8) i32 {
     return width;
 }
 
+fn cardHeight(ctx: DrawContext) i32 {
+    const row_pad: i32 = ROW_PAD * ctx.scale;
+    // Always reserves two lines: large result + normal sublabel.
+    // Space is reserved even when sublabel is absent for visual consistency.
+    return ctx.font_large.*.height + ctx.font.*.height + row_pad * 4 + 4;
+}
+
+// Render a result card for instant handlers (calc, convert).
+// Fixed height always — reserves space for result + sublabel line.
+// Layout: [input] => [result]  right-aligned in large font.
+//                   [sublabel] right-aligned in normal font below result.
+fn drawCard(ctx: DrawContext, input: []const u8, tc: dispatcher.TaggedCandidate, y: i32) void {
+    const pad_h: i32 = PAD_H * ctx.scale;
+    const card_h: i32 = cardHeight(ctx);
+
+    const col_hl   = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
+    const col_white  = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
+    const col_prefix = gfx.pixman_color_t{ .red = 0x6666, .green = 0x6666, .blue = 0x8888, .alpha = 0xffff };
+    const col_sep    = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
+    const col_sub    = gfx.pixman_color_t{ .red = 0x7777, .green = 0x7777, .blue = 0x9999, .alpha = 0xffff };
+
+    drawRect(ctx.surface_image, 0, y, ctx.width, card_h, col_hl);
+
+    // Left: input + arrow, normal font centered in card height
+    const input_baseline = y + @divTrunc(card_h - ctx.font.*.height, 2) + ctx.font.*.ascent;
+    const input_w = measureText(ctx.font, input);
+    renderText(ctx.surface_image, ctx.font, input, pad_h, input_baseline, col_prefix);
+    renderText(ctx.surface_image, ctx.font, "=>", pad_h + input_w + 8, input_baseline, col_sep);
+
+    // Right: result + optional sublabel, centered as a block
+    const result_w = measureText(ctx.font_large, tc.candidate.label);
+    const result_x = ctx.width - pad_h - result_w;
+    if (tc.candidate.sublabel) |sub| {
+        // Two-line block: center (large + gap + normal) together
+        const block_h = ctx.font_large.*.height + 4 + ctx.font.*.height;
+        const block_top = y + @divTrunc(card_h - block_h, 2);
+        const result_baseline = block_top + ctx.font_large.*.ascent;
+        const sub_baseline = block_top + ctx.font_large.*.height + 4 + ctx.font.*.ascent;
+        renderText(ctx.surface_image, ctx.font_large, tc.candidate.label, result_x, result_baseline, col_white);
+        const sub_w = measureText(ctx.font, sub);
+        renderText(ctx.surface_image, ctx.font, sub, ctx.width - pad_h - sub_w, sub_baseline, col_sub);
+    } else {
+        // Single line: center large font in card height
+        const result_baseline = y + @divTrunc(card_h - ctx.font_large.*.height, 2) + ctx.font_large.*.ascent;
+        renderText(ctx.surface_image, ctx.font_large, tc.candidate.label, result_x, result_baseline, col_white);
+    }
+
+}
+
 // Redraw the window: clear + layout + commit to compositor.
 // Called after every keystroke or selection change.
 pub fn redraw(ctx: DrawContext, state: RenderState) void {
@@ -145,7 +198,7 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
     const sep_y: i32 = row_h; // separator sits right below the input row
 
     const icon_size: i32 = ICON_SIZE * ctx.scale;
-    const icon_margin: i32 = 8 * ctx.scale;
+    const icon_margin: i32 = ICON_MARGIN * ctx.scale;
     const footer_h: i32 = icon_size + icon_margin * 2;
     const footer_sep_y: i32 = ctx.height - footer_h;
 
@@ -174,16 +227,28 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
 
     if (state.expanded) |text| {
         var lines = std.mem.splitScalar(u8, text, '\n');
+        var line_idx: usize = 0;
         var row: usize = 0;
-        while (lines.next()) |line| {
+        while (lines.next()) |line| : (line_idx += 1) {
+            if (line_idx < state.expanded_scroll) continue;
             const row_y = sep_y + 1 + @as(i32, @intCast(row)) * row_h;
             if (row_y + row_h > footer_sep_y) break;
             renderText(ctx.surface_image, ctx.font, line, pad_h, row_y + baseline, col_white);
             row += 1;
         }
     } else {
-        for (state.candidates, 0..) |tc, i| {
-            const row_y: i32 = sep_y + 1 + @as(i32, @intCast(i)) * row_h;
+        var content_y: i32 = sep_y + 1;
+        const visible = state.candidates[state.scroll_offset..];
+        for (visible, state.scroll_offset..) |tc, i| {
+            if (content_y >= footer_sep_y) break;
+
+            if (tc.handler.kind == .calc) {
+                drawCard(ctx, state.input, tc, content_y);
+                content_y += cardHeight(ctx);
+                continue;
+            }
+
+            const row_y = content_y;
             const pen_y: i32 = row_y + baseline;
             if (row_y + row_h > footer_sep_y) break;
 
@@ -209,12 +274,9 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
             // Sublabel - inline after label, truncated with ellipsis if it would overlap kind tag
             if (tc.candidate.sublabel) |sub| {
                 const label_w = measureText(ctx.font, tc.candidate.label);
-                const dot_x = pad_h + label_w + 8;
-                const dot_w = measureText(ctx.font, "·");
-                const sub_x = dot_x + dot_w + 8;
+                const sub_x = pad_h + label_w + 16;
                 const ellipsis_w = measureText(ctx.font, "…");
                 const sub_max_w = kind_x - sub_x - pad_h - ellipsis_w;
-                renderText(ctx.surface_image, ctx.font, "·", dot_x, pen_y, col_sep);
                 if (truncateText(ctx.font, sub, sub_max_w)) |len| {
                     renderText(ctx.surface_image, ctx.font, sub[0..len], sub_x, pen_y, col_sub);
                     const truncated_w = measureText(ctx.font, sub[0..len]);
@@ -223,6 +285,8 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
                     renderText(ctx.surface_image, ctx.font, sub, sub_x, pen_y, col_sub);
                 }
             }
+
+            content_y += row_h;
         }
     }
 

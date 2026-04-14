@@ -71,8 +71,13 @@ const App = struct {
 
     scale: i32 = 1,
     font: ?*gfx.struct_fcft_font = null,
+    font_large: ?*gfx.struct_fcft_font = null,
     surface_image: ?*gfx.pixman_image_t = null,
     expanded: ?[]const u8 = null,
+    selected: usize = 0,
+    scroll_offset: usize = 0,
+    expanded_scroll: usize = 0,
+    visible_rows: usize = 0,
 };
 
 pub fn run() !void {
@@ -187,6 +192,24 @@ pub fn run() !void {
     defer gfx.fcft_destroy(font);
     app.font = font;
 
+    var font_large_buf: [64]u8 = undefined;
+    const font_large_name_z = std.fmt.bufPrintZ(&font_large_buf, "monospace:size={d}", .{22 * app.scale})
+        catch return error.FontNameTooLong;
+    var font_large_names = [_][*c]const u8{font_large_name_z.ptr};
+    const font_large = gfx.fcft_from_name(font_large_names.len, @ptrCast(&font_large_names), null) orelse {
+        return error.FontLoadFailed;
+    };
+    defer gfx.fcft_destroy(font_large);
+    app.font_large = font_large;
+
+    // Compute visible_rows from font metrics and window dimensions.
+    // Mirrors the row_h formula in render.zig.
+    const row_h = font.*.height + render.ROW_PAD * 2 * app.scale;
+    const footer_h = render.ICON_SIZE * app.scale + render.ICON_MARGIN * 2 * app.scale;
+    const footer_sep_y = HEIGHT * app.scale - footer_h;
+    const sep_y = row_h;
+    app.visible_rows = @intCast(@divFloor(footer_sep_y - sep_y - 1, row_h));
+
     // --- Phase 4: shared memory buffer ---
     //
     // wl_shm is Wayland's software rendering path — no GPU required.
@@ -281,6 +304,7 @@ fn redraw(app: *App) void {
     const ctx = render.DrawContext{
         .surface_image = app.surface_image orelse return,
         .font = app.font orelse return,
+        .font_large = app.font_large orelse return,
         .scale = app.scale,
         .width = @as(i32, @intCast(WIDTH)) * app.scale,
         .height = @as(i32, @intCast(HEIGHT)) * app.scale,
@@ -292,7 +316,9 @@ fn redraw(app: *App) void {
         .input = app.input.buf[0..app.input.len],
         .expanded = app.expanded,
         .candidates = d.candidates,
-        .selected = d.selected,
+        .selected = app.selected,
+        .scroll_offset = app.scroll_offset,
+        .expanded_scroll = app.expanded_scroll,
     });
 
     const surface = app.surface orelse return;
@@ -423,6 +449,8 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             // we are one level into another mode
             dispatcher.loadMode(d, &dispatcher.default_mode);
             app.input = .{};
+            app.selected = 0;
+            app.scroll_offset = 0;
             dispatcher.run(d, app.input.buf[0..app.input.len]);
             redraw(app);
         }
@@ -446,6 +474,8 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                 std.mem.copyForwards(u8, app.input.buf[start .. app.input.len - removed], app.input.buf[app.input.cursor..app.input.len]);
                 app.input.len -= removed;
                 app.input.cursor = start;
+                app.selected = 0;
+                app.scroll_offset = 0;
                 dispatcher.run(d, app.input.buf[0..app.input.len]);
                 redraw(app);
             }
@@ -458,6 +488,8 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                 const removed = end - app.input.cursor;
                 std.mem.copyForwards(u8, app.input.buf[app.input.cursor .. app.input.len - removed], app.input.buf[end..app.input.len]);
                 app.input.len -= removed;
+                app.selected = 0;
+                app.scroll_offset = 0;
                 dispatcher.run(d, app.input.buf[0..app.input.len]);
                 redraw(app);
             }
@@ -478,21 +510,36 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             }
         },
         xkb.XKB_KEY_Up => {
-            if (d.selected > 0) {
-                d.selected -= 1;
+            if (app.expanded != null) {
+                if (app.expanded_scroll > 0) {
+                    app.expanded_scroll -= 1;
+                    redraw(app);
+                }
+            } else if (app.selected > 0) {
+                app.selected -= 1;
+                if (app.selected < app.scroll_offset)
+                    app.scroll_offset = app.selected;
                 redraw(app);
             }
         },
         xkb.XKB_KEY_Down => {
-            // TODO way too many of .?. things. Is there another option for this?
-            if (d.candidates.len > 0 and d.selected < d.candidates.len - 1) {
-                d.selected += 1;
+            if (app.expanded) |text| {
+                const line_count = std.mem.count(u8, text, "\n") + 1;
+                const max_scroll = if (line_count > app.visible_rows) line_count - app.visible_rows else 0;
+                if (app.expanded_scroll < max_scroll) {
+                    app.expanded_scroll += 1;
+                    redraw(app);
+                }
+            } else if (d.candidates.len > 0 and app.selected < d.candidates.len - 1) {
+                app.selected += 1;
+                if (app.selected >= app.scroll_offset + app.visible_rows)
+                    app.scroll_offset = app.selected - app.visible_rows + 1;
                 redraw(app);
             }
         },
         xkb.XKB_KEY_Return => {
             if (d.candidates.len == 0) return;
-            const tc = d.candidates[d.selected];
+            const tc = d.candidates[app.selected];
             switch (tc.handler.on_enter) {
                 .close => app.running = false,
                 .run => |exec| {
@@ -504,6 +551,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                     const text = expand(std.heap.page_allocator, tc.candidate.key orelse return) catch return;
                     if (app.expanded) |old| std.heap.page_allocator.free(old);
                     app.expanded = text;
+                    app.expanded_scroll = 0;
                     redraw(app);
                 },
             }
@@ -546,6 +594,8 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                 app.input = .{};
             }
 
+            app.selected = 0;
+            app.scroll_offset = 0;
             dispatcher.run(d, app.input.buf[0..app.input.len]);
             redraw(app);
         },
