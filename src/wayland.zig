@@ -6,6 +6,7 @@ const zwlr = @import("wayland").client.zwlr;
 const render = @import("render.zig");
 const gfx = render.gfx; // reuse rener's cImport
 const dispatcher = @import("dispatcher.zig");
+const history = @import("history.zig");
 
 const xkb = @cImport(@cInclude("xkbcommon/xkbcommon.h"));
 
@@ -183,8 +184,7 @@ pub fn run() !void {
     // [*c]const u8 = C-style pointer to const char (what fcft_from_name expects).
     // @ptrCast: reinterpret &font_names as the [*c][*c]const u8 the C API wants.
     var font_buf: [64]u8 = undefined;
-    const font_name_z = std.fmt.bufPrintZ(&font_buf, "monospace:size={d}", .{14 * app.scale}) 
-        catch return error.FontNameTooLong;
+    const font_name_z = std.fmt.bufPrintZ(&font_buf, "monospace:size={d}", .{14 * app.scale}) catch return error.FontNameTooLong;
     var font_names = [_][*c]const u8{font_name_z.ptr};
     const font = gfx.fcft_from_name(font_names.len, @ptrCast(&font_names), null) orelse {
         return error.FontLoadFailed;
@@ -193,8 +193,7 @@ pub fn run() !void {
     app.font = font;
 
     var font_large_buf: [64]u8 = undefined;
-    const font_large_name_z = std.fmt.bufPrintZ(&font_large_buf, "monospace:size={d}", .{22 * app.scale})
-        catch return error.FontNameTooLong;
+    const font_large_name_z = std.fmt.bufPrintZ(&font_large_buf, "monospace:size={d}", .{22 * app.scale}) catch return error.FontNameTooLong;
     var font_large_names = [_][*c]const u8{font_large_name_z.ptr};
     const font_large = gfx.fcft_from_name(font_large_names.len, @ptrCast(&font_large_names), null) orelse {
         return error.FontLoadFailed;
@@ -289,6 +288,7 @@ pub fn run() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
+    history.load();
     app.dispatch = dispatcher.DispatcherState{ .arena = &arena };
     dispatcher.loadMode(&app.dispatch.?, &dispatcher.default_mode);
     dispatcher.run(&app.dispatch.?, app.input.buf[0..app.input.len]);
@@ -298,6 +298,7 @@ pub fn run() !void {
     while (app.running) {
         if (display.dispatch() != .SUCCESS) break;
     }
+    history.save();
 }
 
 fn redraw(app: *App) void {
@@ -323,7 +324,6 @@ fn redraw(app: *App) void {
 
     const surface = app.surface orelse return;
     const buffer = app.wl_buffer orelse return;
-    // TODO again: why is this cast? Can we use the same int type expected?
     surface.setBufferScale(app.scale);
     surface.attach(buffer, 0, 0);
     surface.damageBuffer(0, 0, std.math.maxInt(i32), std.math.maxInt(i32));
@@ -540,6 +540,8 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
         xkb.XKB_KEY_Return => {
             if (d.candidates.len == 0) return;
             const tc = d.candidates[app.selected];
+
+            history.record(tc.handler.name, tc.candidate.id);
             switch (tc.handler.on_enter) {
                 .close => app.running = false,
                 .run => |exec| {
@@ -566,7 +568,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             if (n_signed <= 0) return;
             const n: usize = @intCast(n_signed);
 
-            // TODO make it configurable. For now check Ctrl+Q as "close window" 
+            // TODO make it configurable. For now check Ctrl+Q as "close window"
             if (char_buf[0] == 0x11) {
                 app.running = false;
                 return;

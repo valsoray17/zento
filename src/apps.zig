@@ -5,6 +5,7 @@ const AppEntry = struct {
     name: []const u8,
     comment: []const u8,
     exec: []const u8,
+    desktop_id: []const u8, // e.g. "org.mozilla.firefox.desktop"
 };
 
 const NAME     = "Name=";
@@ -53,6 +54,7 @@ fn scanDir(alloc: std.mem.Allocator, dir_path: []const u8, list: *std.ArrayListU
 }
 
 fn parseDesktopFile(alloc: std.mem.Allocator, dir: std.fs.Dir, file_name: []const u8, buf: []u8) ?AppEntry {
+    const desktop_id = alloc.dupe(u8, file_name) catch return null;
     const contents = dir.readFile(file_name, buf) catch return null;
 
     var lines = std.mem.splitScalar(u8, contents, '\n');
@@ -115,7 +117,7 @@ fn parseDesktopFile(alloc: std.mem.Allocator, dir: std.fs.Dir, file_name: []cons
     const comment_owned = alloc.dupe(u8, c) catch return null;
     const exec_owned = alloc.dupe(u8, exec_stripped[0..out_len]) catch return null;
 
-    return .{ .name = name_owned, .comment = comment_owned, .exec = exec_owned };
+    return .{ .name = name_owned, .comment = comment_owned, .exec = exec_owned, .desktop_id = desktop_id };
 }
 
 pub const handler = h.Handler {
@@ -145,6 +147,7 @@ pub fn load(alloc: std.mem.Allocator) std.mem.Allocator.Error![]h.Candidate {
           .label = entry.name,
           .sublabel = entry.comment,
           .key = entry.exec,
+          .id = entry.desktop_id,
        };
     }
     return candidates;

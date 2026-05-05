@@ -25,9 +25,10 @@ pub const OnEnter = union(enum) {
 };
 
 pub const Candidate = struct {
-    label: []const u8, // "suspend" or "= 8"
+    label: []const u8,            // "suspend" or "= 8"
     sublabel: ?[]const u8 = null, // "Suspend the system" or null
     key: ?[]const u8 = null,
+    id: ?[]const u8 = null,       // stable id for history tracking; null = don't track
 };
 
 /// Handler interface — each plugin implements suggest and optionally execute

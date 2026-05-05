@@ -6,14 +6,15 @@ pub const gfx = @cImport({
 
 const dispatcher = @import("dispatcher.zig");
 
-const PAD_H: i32 = 20; // horizontal padding: left margin for text, right margin for sublabels
+const PAD_H: i32 = 16; // horizontal padding: left margin for text, right margin for sublabels
 pub const ROW_PAD: i32 = 6;  // vertical padding above and below text within each row
 pub const ICON_SIZE: i32 = 24;      // display size
-pub const ICON_MARGIN: i32 = 2;     // gap between footer separator and icon
+pub const ICON_MARGIN: i32 = 4;     // gap between footer separator and icon
+pub const BORDER: i32 = 1;
+pub const CORNER_RADIUS: i32 = 8;
 
 const icon_raw = @embedFile("assets/zento-icon.raw");
 const ICON_RAW_SIZE: i32 = 96;  // pixel size of the embedded raw file
-
 
 pub const DrawContext = struct {
     surface_image: *gfx.pixman_image_t,
@@ -46,6 +47,31 @@ fn drawRect(image: *gfx.pixman_image_t, x: i32, y: i32, w: i32, h: i32, color: g
         .height = @intCast(h),
     };
     _ = gfx.pixman_image_fill_rectangles(gfx.PIXMAN_OP_SRC, image, &c, 1, &rect);
+}
+
+// Draw rounded corners by rasterizing arcs pixel-by-pixel.
+// Pixels outside the outer radius get col_bg (erased), pixels between
+// outer and inner radius get col_border (the arc), inner pixels get col_bg.
+fn drawCorners(image: *gfx.pixman_image_t, w: i32, h: i32, r: i32, bw: i32, col_bg: gfx.pixman_color_t, col_border: gfx.pixman_color_t) void {
+    const col_clear = gfx.pixman_color_t{ .red = 0, .green = 0, .blue = 0, .alpha = 0 };
+    const outer_sq = r * r;
+    const inner_sq = (r - bw) * (r - bw);
+    var dy: i32 = 0;
+    while (dy < r) : (dy += 1) {
+        var dx: i32 = 0;
+        while (dx < r) : (dx += 1) {
+            const adx = r - dx;
+            const ady = r - dy;
+            const dist_sq = adx * adx + ady * ady;
+            const color = if (dist_sq > outer_sq) col_clear
+                          else if (dist_sq > inner_sq) col_border
+                          else col_bg;
+            drawRect(image, dx,         dy,         1, 1, color); // top-left
+            drawRect(image, w - 1 - dx, dy,         1, 1, color); // top-right
+            drawRect(image, dx,         h - 1 - dy, 1, 1, color); // bottom-left
+            drawRect(image, w - 1 - dx, h - 1 - dy, 1, 1, color); // bottom-right
+        }
+    }
 }
 
 // Render a UTF-8 string onto a pixman surface image.
@@ -197,21 +223,31 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
     const baseline: i32 = row_pad + ctx.font.*.ascent;
     const sep_y: i32 = row_h; // separator sits right below the input row
 
-    const icon_size: i32 = ICON_SIZE * ctx.scale;
-    const icon_margin: i32 = ICON_MARGIN * ctx.scale;
-    const footer_h: i32 = icon_size + icon_margin * 2;
-    const footer_sep_y: i32 = ctx.height - footer_h;
-
     // Colors
     const col_bg = gfx.pixman_color_t{ .red = 0x1818, .green = 0x1818, .blue = 0x2828, .alpha = 0xffff };
     const col_hl = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
-    const col_sep = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
-    const col_white = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
+    const col_sep    = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
+    //const col_border = gfx.pixman_color_t{ .red = 0x4a4a, .green = 0x4a4a, .blue = 0x6a6a, .alpha = 0xffff };
+    const col_border = gfx.pixman_color_t{ .red = 0xb4b4, .green = 0xbebe, .blue = 0xfefe, .alpha = 0xffff };
+    const col_white  = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
     const col_prefix = gfx.pixman_color_t{ .red = 0x6666, .green = 0x6666, .blue = 0x8888, .alpha = 0xffff };
     const col_sub = gfx.pixman_color_t{ .red = 0x7777, .green = 0x7777, .blue = 0x9999, .alpha = 0xffff };
 
     // --- Background ---
     drawRect(ctx.surface_image, 0, 0, @intCast(ctx.width), @intCast(ctx.height), col_bg);
+
+    // --- Border ---
+    const border: i32 = BORDER * ctx.scale;
+    drawRect(ctx.surface_image, 0, 0, ctx.width, border, col_border);                   // top
+    drawRect(ctx.surface_image, 0, ctx.height - border, ctx.width, border, col_border); // bottom
+    drawRect(ctx.surface_image, 0, 0, border, ctx.height, col_border);                  // left
+    drawRect(ctx.surface_image, ctx.width - border, 0, border, ctx.height, col_border); // right
+    drawCorners(ctx.surface_image, ctx.width, ctx.height, CORNER_RADIUS * ctx.scale, border, col_bg, col_border);
+
+    const icon_size: i32 = ICON_SIZE * ctx.scale;
+    const icon_margin: i32 = ICON_MARGIN * ctx.scale;
+    const footer_h: i32 = icon_size + icon_margin * 2;
+    const footer_sep_y: i32 = ctx.height - footer_h - border;
 
     // --- Input row ---
     // "> " prefix in muted color, then the typed text in white.
@@ -220,10 +256,10 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
     renderText(ctx.surface_image, ctx.font, state.input, pad_h + prefix_w, baseline, col_white);
 
     // --- Separator ---
-    drawRect(ctx.surface_image, 0, sep_y, @intCast(ctx.width), 1, col_sep);
+    drawRect(ctx.surface_image, border, sep_y, ctx.width - border * 2, 1, col_sep);
 
     // --- Footer separator ---
-    drawRect(ctx.surface_image, 0, footer_sep_y, @intCast(ctx.width), 1, col_sep);
+    drawRect(ctx.surface_image, border, footer_sep_y, ctx.width - border * 2, 1, col_sep);
 
     if (state.expanded) |text| {
         var lines = std.mem.splitScalar(u8, text, '\n');
@@ -252,9 +288,9 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
             const pen_y: i32 = row_y + baseline;
             if (row_y + row_h > footer_sep_y) break;
 
-            // Highlight the selected row with a full-width rectangle.
+            // Highlight the selected row, inset by border so it doesn't overlap it.
             if (i == state.selected) {
-                drawRect(ctx.surface_image, 0, row_y, @intCast(ctx.width), row_h, col_hl);
+                drawRect(ctx.surface_image, border, row_y, ctx.width - border * 2, row_h, col_hl);
             }
 
             // Label — left-aligned with horizontal padding.

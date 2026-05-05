@@ -95,6 +95,7 @@ pub fn load(allocator: std.mem.Allocator) std.mem.Allocator.Error![]h.Candidate 
             .label = entry.keyword,
             .sublabel = entry.sublabel,
             .key = entry.method,
+            .id = entry.keyword,
         };
     }
 

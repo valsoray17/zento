@@ -8,6 +8,7 @@ const systemd = @import("systemd.zig");
 const apps = @import("apps.zig");
 
 const fuzzy = @import("fuzzy.zig");
+const history = @import("history.zig");
 
 pub const TaggedCandidate = struct {
     candidate: handler.Candidate,
@@ -66,7 +67,13 @@ pub fn run(state: *DispatcherState, input: []const u8) void {
     const Ranked = struct { tagged: TaggedCandidate, score: f32 };
     var ranked: std.ArrayListUnmanaged(Ranked) = .empty;
     for (all.items) |tc| {
-        const s: f32 = if (tc.handler.kind == .calc) 1.0 else fuzzy.score(input, tc.candidate.label);
+        var s: f32 = if (tc.handler.kind == .calc) 1.0 else fuzzy.score(input, tc.candidate.label);
+        if (tc.candidate.id) |id| {
+            var key_buf: [256]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ tc.handler.name, id }) catch continue;
+            const freq = history.getFrequency(key);
+            s += std.math.log2(@as(f32, @floatFromInt(freq+1)));
+        }
         if (s > 0) ranked.append(alloc, .{ .tagged = tc, .score = s }) catch continue;
     }
 
@@ -89,7 +96,6 @@ pub fn run(state: *DispatcherState, input: []const u8) void {
     };
     for (top, 0..) |r, i| out[i] = r.tagged;
     state.candidates = out;
-
 }
 
 pub fn loadMode(state: *DispatcherState, mode: *const Mode) void {

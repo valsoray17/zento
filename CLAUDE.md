@@ -20,7 +20,8 @@ Background: Coming from Go.
   - `src/systemd.zig` — power commands via D-Bus (suggest + execute)
   - `src/apps.zig` — app launcher via `.desktop` file scanning
   - `src/handler.zig` — shared types (Candidate, Handler, ResultKind)
-- `src/dispatcher.zig` — collects + ranks candidates from all handlers, owns arena + mode + selected
+- `src/dispatcher.zig` — collects + ranks candidates from all handlers, owns arena + mode; applies frequency boost
+- `src/history.zig` — frequency/usage tracking; loads from disk at startup, persists on close
 - `src/render.zig` — pixman/fcft rendering (DrawContext + RenderState, no Wayland knowledge)
 - `src/wayland.zig` — Wayland event loop, keyboard input, calls dispatcher + render
 - `src/fuzzy.zig` — fuzzy scoring with consecutive run reward + word boundary bonus
@@ -36,7 +37,7 @@ Background: Coming from Go.
 - [x] Dictionary/define word (see Dictionary section below)
 - [ ] **Key repeat** (timerfd + poll)
 - [ ] **Readline shortcuts** — Ctrl+A/E/U/K/W
-- [ ] **Frequency tracking** — remember frequently launched apps (see plan-frequency.md)
+- [x] **Frequency tracking** — remember frequently launched apps (see plan-frequency.md)
 - [ ] **Dict: scan all StarDict dirs** instead of hardcoded path (see plan-frequency.md TODO)
 - [ ] Unit conversions
   - [x] F to C (supports both "to" and "in" separators)
