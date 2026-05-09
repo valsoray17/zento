@@ -1,150 +1,35 @@
 const std = @import("std");
 const h = @import("handler.zig");
-
-// ============================================================================
-// Temperature
-// ============================================================================
-
-// Temperature units — simple enum with just two values
-//
-// In Go, you'd write:
-//   type TempUnit int
-//   const (
-//       Celsius TempUnit = iota
-//       Fahrenheit
-//   )
-//   func (u TempUnit) String() string { ... }
-//
-// Zig allows methods directly inside enums — cleaner!
-const TempUnit = enum {
-    celsius,
-    fahrenheit,
-
-    // Parse string suffix to temperature unit (case-insensitive)
-    fn fromStr(s: []const u8) ?TempUnit {
-        if (s.len == 0) return null;
-        return switch (s[0]) {
-            'C', 'c' => .celsius,
-            'F', 'f' => .fahrenheit,
-            else => null,
-        };
-    }
-
-    fn toStr(self: TempUnit) []const u8 {
-        return switch (self) {
-            .celsius => "C°",
-            .fahrenheit => "F°",
-        };
-    }
-};
-
-// Convert temperature: "F to C" with value 32 → "0.00 C"
-fn convertTemperature(allocator: std.mem.Allocator, value: f64, rest: []const u8) std.mem.Allocator.Error!?[]const u8 {
-    const sep = findSeparator(rest) orelse return null;
-
-    const from_str = std.mem.trim(u8, rest[0..sep.pos], " ");
-    const to_str = std.mem.trim(u8, rest[sep.pos + sep.len ..], " ");
-
-    const from_unit = TempUnit.fromStr(from_str) orelse return null;
-    const to_unit = TempUnit.fromStr(to_str) orelse return null;
-
-    const result: f64 = switch (from_unit) {
-        .celsius => switch (to_unit) {
-            .celsius => value,
-            .fahrenheit => value * 9.0 / 5.0 + 32.0,
-        },
-        .fahrenheit => switch (to_unit) {
-            .celsius => (value - 32.0) * 5.0 / 9.0,
-            .fahrenheit => value,
-        },
-    };
-
-    return try std.fmt.allocPrint(allocator, "= {d:.2} {s}", .{ result, to_unit.toStr() });
-}
-
-// ============================================================================
-// Data Units
-// ============================================================================
-
-// Data size units — bytes, KB, MB, GB, TB
-//
-// Using binary units (1 KB = 1024 bytes), which is standard for storage.
-const DataUnit = enum {
-    bytes,
-    kb,
-    mb,
-    gb,
-    tb,
-
-    fn fromStr(s: []const u8) ?DataUnit {
-        if (s.len == 0) return null;
-
-        if (s.len >= 2) {
-            const first = std.ascii.toLower(s[0]);
-            const second = std.ascii.toLower(s[1]);
-
-            if (first == 'k' and second == 'b') return .kb;
-            if (first == 'm' and second == 'b') return .mb;
-            if (first == 'g' and second == 'b') return .gb;
-            if (first == 't' and second == 'b') return .tb;
-        }
-
-        if (s.len >= 1 and (s[0] == 'B' or s[0] == 'b')) {
-            if (s.len == 1) return .bytes;
-        }
-
-        return null;
-    }
-
-    fn toStr(self: DataUnit) []const u8 {
-        return switch (self) {
-            .bytes => "B",
-            .kb => "KB",
-            .mb => "MB",
-            .gb => "GB",
-            .tb => "TB",
-        };
-    }
-
-    fn toBytes(self: DataUnit) u64 {
-        return switch (self) {
-            .bytes => 1,
-            .kb => 1024,
-            .mb => 1024 * 1024,
-            .gb => 1024 * 1024 * 1024,
-            .tb => 1024 * 1024 * 1024 * 1024,
-        };
-    }
-};
-
-// Convert data size: "MB to KB" with value 100 → "= 102400.00 KB"
-fn convertDataUnit(allocator: std.mem.Allocator, value: f64, rest: []const u8) std.mem.Allocator.Error!?[]const u8 {
-    const sep = findSeparator(rest) orelse return null;
-
-    const from_str = std.mem.trim(u8, rest[0..sep.pos], " ");
-    const to_str = std.mem.trim(u8, rest[sep.pos + sep.len ..], " ");
-
-    const from_unit = DataUnit.fromStr(from_str) orelse return null;
-    const to_unit = DataUnit.fromStr(to_str) orelse return null;
-
-    const bytes = value * @as(f64, @floatFromInt(from_unit.toBytes()));
-    const result = bytes / @as(f64, @floatFromInt(to_unit.toBytes()));
-
-    return try std.fmt.allocPrint(allocator, "= {d:.2} {s}", .{ result, to_unit.toStr() });
-}
+const temperature = @import("convert/temperature.zig");
+const data = @import("convert/data.zig");
 
 // ============================================================================
 // Shared helpers
 // ============================================================================
 
-// Find conversion separator (" to " or " in ") in input
-fn findSeparator(input: []const u8) ?struct { pos: usize, len: usize } {
-    if (std.mem.indexOf(u8, input, " to ")) |pos| {
-        return .{ .pos = pos, .len = 4 };
-    }
-    if (std.mem.indexOf(u8, input, " in ")) |pos| {
-        return .{ .pos = pos, .len = 4 };
-    }
+// Parse the leading unit token (non-space characters) from input.
+//
+// "ms to s"  → { token: "ms", rest: "to s" }
+// "MB to KB" → { token: "MB", rest: "to KB" }
+// "F"        → { token: "F",  rest: "" }
+fn parseUnitToken(input: []const u8) struct { token: []const u8, rest: []const u8 } {
+    const trimmed = std.mem.trim(u8, input, " ");
+    var end: usize = 0;
+    while (end < trimmed.len and trimmed[end] != ' ') : (end += 1) {}
+    return .{
+        .token = trimmed[0..end],
+        .rest = std.mem.trim(u8, trimmed[end..], " "),
+    };
+}
+
+// Strip a leading "to " or "in " separator, return the rest.
+//
+// "to s"  → "s"
+// "in KB" → "KB"
+// "s"     → null
+fn stripSeparator(s: []const u8) ?[]const u8 {
+    if (std.mem.startsWith(u8, s, "to ")) return std.mem.trim(u8, s[3..], " ");
+    if (std.mem.startsWith(u8, s, "in ")) return std.mem.trim(u8, s[3..], " ");
     return null;
 }
 
@@ -177,27 +62,33 @@ fn parseNumberPrefix(input: []const u8) ?struct { value: f64, rest: []const u8 }
 // ============================================================================
 // Handler interface
 // ============================================================================
-pub const handler = h.Handler {
+pub const handler = h.Handler{
     .name = "convert",
     .kind = .calc,
     .on_enter = .close,
     .source = .{ .suggest = suggest },
 };
 
-/// Return 0 or 1 candidates if input is a valid unit conversion
 pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]h.Candidate {
     var candidates = try allocator.alloc(h.Candidate, 1);
 
     const parsed = parseNumberPrefix(input) orelse return candidates[0..0];
+    const from = parseUnitToken(parsed.rest);
+    if (from.token.len == 0) return candidates[0..0];
 
-    // Try each converter until one succeeds
-    const label = try convertTemperature(allocator, parsed.value, parsed.rest) orelse
-        try convertDataUnit(allocator, parsed.value, parsed.rest) orelse
-        return candidates[0..0];
+    const after_sep = stripSeparator(from.rest) orelse return candidates[0..0];
+    const to = parseUnitToken(after_sep);
+    if (to.token.len == 0) return candidates[0..0];
 
-    candidates[0] = .{
-        .label = label,
-        .sublabel = "test", // TODO remove this later
-    };
-    return candidates[0..1];
+    if (temperature.Unit.fromStr(from.token)) |from_unit| {
+        const to_unit = temperature.Unit.fromStr(to.token) orelse return candidates[0..0];
+        candidates[0] = .{ .label = try temperature.express(from_unit, allocator, parsed.value, to_unit) };
+        return candidates[0..1];
+    }
+    if (data.Unit.fromStr(from.token)) |from_unit| {
+        const to_unit = data.Unit.fromStr(to.token) orelse return candidates[0..0];
+        candidates[0] = .{ .label = try data.express(from_unit, allocator, parsed.value, to_unit) };
+        return candidates[0..1];
+    }
+    return candidates[0..0];
 }
