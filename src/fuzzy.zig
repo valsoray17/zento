@@ -9,7 +9,7 @@ const std = @import("std");
 pub fn score(input: []const u8, label: []const u8) f32 {
     // TODO why in fuzzel 'gogo' input shows both Google Chrome and Problem Reporting?
     if (input.len == 0) return 1.0;
-    var i: usize = 0;         // position in input
+    var i: usize = 0; // position in input
     var consecutive: f32 = 0;
     var total: f32 = 0;
     var first_match_pos: ?usize = null;
@@ -22,8 +22,7 @@ pub fn score(input: []const u8, label: []const u8) f32 {
             i += 1;
             if (i == input.len) {
                 // Apply word boundary bonus
-                const boundary = if (first_match_pos.? == 0) true
-                    else isSeparator(label[first_match_pos.? - 1]);
+                const boundary = if (first_match_pos.? == 0) true else isSeparator(label[first_match_pos.? - 1]);
                 return if (boundary) total * 2.0 else total;
             }
         } else {
@@ -36,4 +35,3 @@ pub fn score(input: []const u8, label: []const u8) f32 {
 fn isSeparator(c: u8) bool {
     return c == ' ' or c == '-' or c == '_' or c == '.';
 }
-

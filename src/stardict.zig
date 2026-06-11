@@ -173,9 +173,10 @@ test "IdxParser - multiple entries" {
         // Entry 1: "apple" at offset 0, size 10
         'a', 'p', 'p', 'l', 'e', 0,
         0, 0, 0, 0, // offset = 0
-        0, 0, 0, 10, // size = 10
+        0,   0,   0,   10, // size = 10
         // Entry 2: "banana" at offset 10, size 15
-        'b', 'a', 'n', 'a', 'n', 'a', 0,
+        'b', 'a', 'n', 'a',
+        'n', 'a', 0,
         0, 0, 0, 10, // offset = 10
         0, 0, 0, 15, // size = 15
     };
@@ -239,8 +240,9 @@ pub fn parseAllEntries(allocator: std.mem.Allocator, idx_data: []const u8, wordc
 
 test "parseAllEntries - parses with wordcount" {
     const idx_data = [_]u8{
-        'a', 'p', 'e', 0, 0, 0, 0, 0, 0, 0, 0, 10,
-        'a', 'p', 'p', 'l', 'e', 0, 0, 0, 0, 10, 0, 0, 0, 20,
+        'a', 'p', 'e', 0,   0,   0, 0, 0, 0, 0,  0, 10,
+        'a', 'p', 'p', 'l', 'e', 0, 0, 0, 0, 10, 0, 0,
+        0,   20,
     };
 
     const entries = try parseAllEntries(std.testing.allocator, &idx_data, 2);
@@ -392,14 +394,11 @@ pub const ReadError = error{
 // Returns slice of buffer containing the definition
 //
 // Go equivalent: file.Seek + file.Read
-pub fn readDefinition(file: std.fs.File, entry: IdxEntry, buf: []u8) ReadError![]const u8 {
+pub fn readDefinition(io: std.Io, file: std.Io.File, entry: IdxEntry, buf: []u8) ReadError![]const u8 {
     if (entry.size > buf.len) return error.BufferTooSmall;
 
-    // Seek to definition offset
-    file.seekTo(entry.offset) catch return error.SeekFailed;
-
-    // Read definition into buffer
-    const bytes_read = file.readAll(buf[0..entry.size]) catch return error.ReadFailed;
+    // Read the definition directly at its offset (0.16 positional read — pread-style)
+    const bytes_read = file.readPositionalAll(io, buf[0..entry.size], entry.offset) catch return error.ReadFailed;
     if (bytes_read != entry.size) return error.UnexpectedEof;
 
     return buf[0..entry.size];
@@ -458,17 +457,18 @@ test "readDefinition - buffer too small" {
 pub const Dictionary = struct {
     entries: []IdxEntry,
     idx_data: []const u8, // entries point into this, must outlive entries
-    dict_file: std.fs.File,
+    dict_file: std.Io.File,
     allocator: std.mem.Allocator,
 
     // Load dictionary from a directory containing .ifo, .idx, .dict files
     // dict_name is the base name (e.g., "webster-1913" for webster-1913.ifo)
-    pub fn load(allocator: std.mem.Allocator, dir_path: []const u8, dict_name: []const u8) !Dictionary {
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, dict_name: []const u8) !Dictionary {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.Io.Dir.cwd();
 
         // Read and parse .ifo
         const ifo_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.ifo", .{ dir_path, dict_name });
-        const ifo_data = try std.fs.cwd().readFileAlloc(allocator, ifo_path, 64 * 1024);
+        const ifo_data = try cwd.readFileAlloc(io, ifo_path, allocator, .limited(64 * 1024));
         defer allocator.free(ifo_data);
 
         const ifo = parseIfo(ifo_data) orelse return error.InvalidIfo;
@@ -476,7 +476,7 @@ pub const Dictionary = struct {
 
         // Read and parse .idx
         const idx_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.idx", .{ dir_path, dict_name });
-        const idx_data = try std.fs.cwd().readFileAlloc(allocator, idx_path, 100 * 1024 * 1024);
+        const idx_data = try cwd.readFileAlloc(io, idx_path, allocator, .limited(100 * 1024 * 1024));
         errdefer allocator.free(idx_data);
 
         const entries = try parseAllEntries(allocator, idx_data, wordcount);
@@ -484,7 +484,7 @@ pub const Dictionary = struct {
 
         // Open .dict file (keep open for seeking)
         const dict_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.dict", .{ dir_path, dict_name });
-        const dict_file = try std.fs.cwd().openFile(dict_path, .{});
+        const dict_file = try std.Io.Dir.openFileAbsolute(io, dict_path, .{});
 
         return Dictionary{
             .entries = entries,
@@ -494,8 +494,8 @@ pub const Dictionary = struct {
         };
     }
 
-    pub fn deinit(self: *Dictionary) void {
-        self.dict_file.close();
+    pub fn deinit(self: *Dictionary, io: std.Io) void {
+        self.dict_file.close(io);
         self.allocator.free(self.entries);
         self.allocator.free(self.idx_data);
     }

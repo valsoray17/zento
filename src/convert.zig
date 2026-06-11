@@ -62,33 +62,38 @@ fn parseNumberPrefix(input: []const u8) ?struct { value: f64, rest: []const u8 }
 // ============================================================================
 // Handler interface
 // ============================================================================
-pub const handler = h.Handler{
-    .name = "convert",
-    .kind = .calc,
-    .on_enter = .close,
-    .source = .{ .suggest = suggest },
+pub const Convert = struct {
+    pub fn suggest(_: *Convert, _: std.Io, allocator: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]h.Candidate {
+        var candidates = try allocator.alloc(h.Candidate, 1);
+
+        const parsed = parseNumberPrefix(input) orelse return candidates[0..0];
+        const from = parseUnitToken(parsed.rest);
+        if (from.token.len == 0) return candidates[0..0];
+
+        const after_sep = stripSeparator(from.rest) orelse return candidates[0..0];
+        const to = parseUnitToken(after_sep);
+        if (to.token.len == 0) return candidates[0..0];
+
+        if (temperature.Unit.fromStr(from.token)) |from_unit| {
+            const to_unit = temperature.Unit.fromStr(to.token) orelse return candidates[0..0];
+            candidates[0] = .{ .label = try temperature.express(from_unit, allocator, parsed.value, to_unit) };
+            return candidates[0..1];
+        }
+        if (data.Unit.fromStr(from.token)) |from_unit| {
+            const to_unit = data.Unit.fromStr(to.token) orelse return candidates[0..0];
+            candidates[0] = .{ .label = try data.express(from_unit, allocator, parsed.value, to_unit) };
+            return candidates[0..1];
+        }
+        return candidates[0..0];
+    }
+
+    pub fn handler(self: *Convert) h.Handler {
+        return .{
+            .ptr = self,
+            .name = "convert",
+            .kind = .calc,
+            .on_enter = .close,
+            .source = .{ .suggest = h.suggestFn(Convert) },
+        };
+    }
 };
-
-pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]h.Candidate {
-    var candidates = try allocator.alloc(h.Candidate, 1);
-
-    const parsed = parseNumberPrefix(input) orelse return candidates[0..0];
-    const from = parseUnitToken(parsed.rest);
-    if (from.token.len == 0) return candidates[0..0];
-
-    const after_sep = stripSeparator(from.rest) orelse return candidates[0..0];
-    const to = parseUnitToken(after_sep);
-    if (to.token.len == 0) return candidates[0..0];
-
-    if (temperature.Unit.fromStr(from.token)) |from_unit| {
-        const to_unit = temperature.Unit.fromStr(to.token) orelse return candidates[0..0];
-        candidates[0] = .{ .label = try temperature.express(from_unit, allocator, parsed.value, to_unit) };
-        return candidates[0..1];
-    }
-    if (data.Unit.fromStr(from.token)) |from_unit| {
-        const to_unit = data.Unit.fromStr(to.token) orelse return candidates[0..0];
-        candidates[0] = .{ .label = try data.express(from_unit, allocator, parsed.value, to_unit) };
-        return candidates[0..1];
-    }
-    return candidates[0..0];
-}

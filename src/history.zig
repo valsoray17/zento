@@ -6,44 +6,48 @@ var usage: std.StringHashMap(u32) = undefined;
 const frequency_filename = "frequency";
 const usage_filename = "usage";
 
-pub fn load() void {
+fn getCachePath(buf: []u8, home: ?[]const u8, cache_home: ?[]const u8) ?[]u8 {
+    if (cache_home) |ch| {
+        return std.fmt.bufPrint(buf, "{s}/zento", .{ch}) catch null;
+    }
+    const h = home orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/.cache/zento", .{h}) catch null;
+}
+
+pub fn load(io: std.Io, home: ?[]const u8, cache_home: ?[]const u8) void {
     frequency = std.StringHashMap(u32).init(std.heap.page_allocator);
     usage = std.StringHashMap(u32).init(std.heap.page_allocator);
 
-    const home = std.posix.getenv("HOME") orelse return;
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const zento_path = std.fmt.bufPrint(&path_buf, "{s}/.local/share/zento", .{home}) catch return;
+    const zento_path = getCachePath(&path_buf, home, cache_home) orelse return;
 
-    var zento_dir = std.fs.openDirAbsolute(zento_path, .{}) catch return;
-    defer zento_dir.close();
+    var zento_dir = std.Io.Dir.openDirAbsolute(io, zento_path, .{}) catch return;
+    defer zento_dir.close(io);
 
-    loadFile(&frequency, zento_dir, frequency_filename);
-    loadFile(&usage, zento_dir, usage_filename);
+    loadFile(io, &frequency, zento_dir, frequency_filename);
+    loadFile(io, &usage, zento_dir, usage_filename);
 }
 
-pub fn save() void {
-    const home = std.posix.getenv("HOME") orelse return;
+pub fn save(io: std.Io, home: ?[]const u8, cache_home: ?[]const u8) void {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const zento_path = std.fmt.bufPrint(&path_buf, "{s}/.local/share/zento", .{home}) catch return;
+    const zento_path = getCachePath(&path_buf, home, cache_home) orelse return;
 
-    std.fs.makeDirAbsolute(zento_path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => return,
-    };
-    var zento_dir = std.fs.openDirAbsolute(zento_path, .{}) catch return;
-    defer zento_dir.close();
+    std.Io.Dir.createDirPath(std.Io.Dir.cwd(), io, zento_path) catch return;
 
-    saveFile(frequency, zento_dir, frequency_filename);
-    saveFile(usage, zento_dir, usage_filename);
+    var zento_dir = std.Io.Dir.openDirAbsolute(io, zento_path, .{}) catch return;
+    defer zento_dir.close(io);
+
+    saveFile(io, frequency, zento_dir, frequency_filename);
+    saveFile(io, usage, zento_dir, usage_filename);
 }
 
-fn saveFile(map: std.StringHashMap(u32), dir: std.fs.Dir, filename: []const u8) void {
-    const file = dir.createFile(filename, .{}) catch return;
-    defer file.close();
+fn saveFile(io: std.Io, map: std.StringHashMap(u32), dir: std.Io.Dir, filename: []const u8) void {
+    const file = std.Io.Dir.createFile(dir, io, filename, .{}) catch return;
+    defer file.close(io);
 
     var buf: [4096]u8 = undefined;
-    var fw = file.writer(&buf);
-    const w = &fw.interface;   
+    var fw = file.writer(io, &buf);
+    const w = &fw.interface;
 
     var it = map.iterator();
     while (it.next()) |entry| {
@@ -106,9 +110,10 @@ pub fn record(handler_name: []const u8, candidate_id: ?[]const u8) void {
         freq_entry.value_ptr.* += 1;
     }
 }
-fn loadFile(map: *std.StringHashMap(u32), dir: std.fs.Dir, filename: []const u8) void {
-    const contents = dir.readFileAlloc(std.heap.page_allocator, filename, 64 * 1024) catch return;
-    defer std.heap.page_allocator.free(contents);
+
+fn loadFile(io: std.Io, map: *std.StringHashMap(u32), dir: std.Io.Dir, filename: []const u8) void {
+    var file_buf: [64 * 1024]u8 = undefined;
+    const contents = std.Io.Dir.readFile(dir, io, filename, &file_buf) catch return;
     var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;

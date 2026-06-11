@@ -1,11 +1,31 @@
 const std = @import("std");
 const h = @import("handler.zig");
 
-pub const handler = h.Handler {
-    .name = "calc",
-    .kind = .calc,
-    .on_enter = .close,
-    .source = .{ .suggest = suggest },
+pub const Calc = struct {
+    /// Return 0 or 1 candidates if input is a valid math expression
+    pub fn suggest(_: *Calc, _: std.Io, allocator: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]h.Candidate {
+        var candidates = try allocator.alloc(h.Candidate, 1);
+
+        const result = calculate(input) orelse return candidates[0..0];
+
+        // Label is dynamic ("= 5", "= 3.14") — allocated from the arena
+        const label = try std.fmt.allocPrint(allocator, "= {d}", .{result});
+
+        candidates[0] = .{
+            .label = label,
+            .sublabel = null,
+        };
+        return candidates[0..1];
+    }
+    pub fn handler(self: *Calc) h.Handler {
+        return .{
+            .ptr = self,
+            .name = "calc",
+            .kind = .calc,
+            .on_enter = .close,
+            .source = .{ .suggest = h.suggestFn(Calc) },
+        };
+    }
 };
 
 /// Try to evaluate a math expression (e.g., "2+3", "10 / 3", "-5+3")
@@ -43,20 +63,4 @@ fn calculate(input: []const u8) ?f64 {
         '%' => @mod(left, right),
         else => null,
     };
-}
-
-/// Return 0 or 1 candidates if input is a valid math expression
-pub fn suggest(allocator: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]h.Candidate {
-    var candidates = try allocator.alloc(h.Candidate, 1);
-
-    const result = calculate(input) orelse return candidates[0..0];
-
-    // Label is dynamic ("= 5", "= 3.14") — allocated from the arena
-    const label = try std.fmt.allocPrint(allocator, "= {d}", .{result});
-
-    candidates[0] = .{
-        .label = label,
-        .sublabel = null,
-    };
-    return candidates[0..1];
 }

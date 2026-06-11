@@ -9,15 +9,15 @@ pub const Unit = enum {
 
     pub fn fromStr(s: []const u8) ?@This() {
         const table = [_]struct { str: []const u8, unit: Unit }{
-            .{ .str = "b",         .unit = .bytes },
-            .{ .str = "bytes",     .unit = .bytes },
-            .{ .str = "kb",        .unit = .kb },
+            .{ .str = "b", .unit = .bytes },
+            .{ .str = "bytes", .unit = .bytes },
+            .{ .str = "kb", .unit = .kb },
             .{ .str = "kilobytes", .unit = .kb },
-            .{ .str = "mb",        .unit = .mb },
+            .{ .str = "mb", .unit = .mb },
             .{ .str = "megabytes", .unit = .mb },
-            .{ .str = "gb",        .unit = .gb },
+            .{ .str = "gb", .unit = .gb },
             .{ .str = "gigabytes", .unit = .gb },
-            .{ .str = "tb",        .unit = .tb },
+            .{ .str = "tb", .unit = .tb },
             .{ .str = "terabytes", .unit = .tb },
         };
         for (table) |entry| {

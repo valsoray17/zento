@@ -37,8 +37,8 @@
     // internet connectivity.
     .dependencies = .{
         .wayland = .{
-            .url = "https://codeberg.org/ifreund/zig-wayland/archive/v0.4.0.tar.gz",
-            .hash = "wayland-0.4.0-lQa1khbMAQAsLS2eBR7M5lofyEGPIbu2iFDmoz8lPC27",
+            .url = "https://codeberg.org/ifreund/zig-wayland/archive/refs/heads/main.tar.gz",
+            .hash = "wayland-0.7.0-dev-lQa1krn7AQCMUzT3J6gWyukl3L3kbMtCZy9djQemUYA-",
         },
     },
     .paths = .{

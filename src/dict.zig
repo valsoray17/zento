@@ -2,32 +2,89 @@ const std = @import("std");
 const h = @import("handler.zig");
 const stardict = @import("stardict.zig");
 
-var state = struct {
+pub const Dict = struct {
+    home: ?[]const u8,
     loaded: bool = false,
     dictionary: ?stardict.Dictionary = null,
-}{};
 
-pub const handler = h.Handler {
-    .name = "dict",
-    .kind = .dict,
-    .on_enter = .{ .show = expandEntry },
-    .source = .{ .suggest = suggest },
-};
-
-pub fn lookup(alloc: std.mem.Allocator, word: []const u8) ![]const u8 {
-    const d = state.dictionary orelse return error.NotLoaded;
-    // findByPrefix matches case-insensitively; an exact hit is one where the
-    // stored word has the same length as the query (prefix match already
-    // guarantees the same characters).
-    const matches = stardict.findByPrefix(d.entries, word);
-    for (matches) |entry| {
-        if (entry.word.len == word.len) {
-            const buf = try alloc.alloc(u8, entry.size);
-            return stardict.readDefinition(d.dict_file, entry, buf);
-        }
+    pub fn init(home: ?[]const u8) Dict {
+        return .{ .home = home };
     }
-    return error.NotFound;
-}
+
+    pub fn lookup(self: *Dict, io: std.Io, alloc: std.mem.Allocator, word: []const u8) ![]const u8 {
+        const d = self.dictionary orelse return error.NotLoaded;
+        // findByPrefix matches case-insensitively; an exact hit is one where the
+        // stored word has the same length as the query (prefix match already
+        // guarantees the same characters).
+        const matches = stardict.findByPrefix(d.entries, word);
+        for (matches) |entry| {
+            if (entry.word.len == word.len) {
+                const buf = try alloc.alloc(u8, entry.size);
+                return stardict.readDefinition(io, d.dict_file, entry, buf);
+            }
+        }
+        return error.NotFound;
+    }
+
+    pub fn expand(self: *Dict, io: std.Io, alloc: std.mem.Allocator, key: []const u8) anyerror![]const u8 {
+        const raw = try self.lookup(io, alloc, key);
+        const stripped = try stripEtymology(alloc, raw);
+        return collapseNewlines(alloc, stripped);
+    }
+
+    /// Return candidates for a dictionary query (the word/prefix to search).
+    /// Lazy-loads the dictionary on first call. Returns empty slice on load failure.
+    /// Caller is responsible for mode detection and prefix stripping.
+    pub fn suggest(self: *Dict, io: std.Io, allocator: std.mem.Allocator, query: []const u8) std.mem.Allocator.Error![]h.Candidate {
+        if (!self.loaded) {
+            // Mark loaded first — prevents infinite retry if the file is missing.
+            self.loaded = true;
+            // TODO: scan ~/.stardict/dic/ for all subdirectories (like sdcv does) instead
+            // of hardcoding a single dictionary name. Also check /usr/share/stardict/dic/.
+            // Support ZENTO_DICT_DIR env var as an override.
+            const home = self.home orelse "/tmp";
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const dir = std.fmt.bufPrint(&buf, "{s}/.stardict/dic/stardict-dictd-web1913-2.4.2", .{home}) catch return &.{};
+            const start = std.Io.Clock.awake.now(io);
+            // page_allocator, not the caller's arena — dictionary is session-level
+            // data that must outlive arena resets between keystrokes.
+            self.dictionary = stardict.Dictionary.load(io, std.heap.page_allocator, dir, "dictd_www.dict.org_web1913") catch null;
+            const ms = start.untilNow(io, .awake).toMilliseconds();
+            if (self.dictionary) |d| {
+                std.log.info("dictionary: {} words in {}ms", .{ d.entries.len, ms });
+            } else {
+                std.log.warn("dictionary not loaded (file missing?)", .{});
+            }
+        }
+        const d = self.dictionary orelse return &.{};
+        if (query.len == 0) return &.{};
+
+        const matches = stardict.findByPrefix(d.entries, query);
+        if (matches.len == 0) return &.{};
+
+        const count = @min(matches.len, 30);
+        var candidates = try allocator.alloc(h.Candidate, count);
+
+        for (matches[0..count], 0..) |entry, i| {
+            candidates[i] = .{
+                .label = entry.word,
+                .key = entry.word,
+            };
+        }
+
+        return candidates;
+    }
+
+    pub fn handler(self: *Dict) h.Handler {
+        return .{
+            .ptr = self,
+            .name = "dict",
+            .kind = .dict,
+            .on_enter = .{ .show = h.expandFn(Dict) },
+            .source = .{ .suggest = h.suggestFn(Dict) },
+        };
+    }
+};
 
 // Find and remove all etymology blocks in a Webster 1913 definition.
 // Etymology is the only [...] block that spans multiple lines — grammar info
@@ -105,62 +162,16 @@ fn collapseNewlines(alloc: std.mem.Allocator, text: []const u8) ![]const u8 {
     prev_nl = false;
     for (text) |c| {
         if (c == '\n') {
-            if (!prev_nl) { result[pos] = c; pos += 1; }
+            if (!prev_nl) {
+                result[pos] = c;
+                pos += 1;
+            }
             prev_nl = true;
         } else {
-            result[pos] = c; pos += 1;
+            result[pos] = c;
+            pos += 1;
             prev_nl = false;
         }
     }
     return result;
-}
-
-fn expandEntry(alloc: std.mem.Allocator, key: []const u8) anyerror![]const u8 {
-    const raw = try lookup(alloc, key);
-    const stripped = try stripEtymology(alloc, raw);
-    return collapseNewlines(alloc, stripped);
-}
-
-/// Return candidates for a dictionary query (the word/prefix to search).
-/// Lazy-loads the dictionary on first call. Returns empty slice on load failure.
-/// Caller is responsible for mode detection and prefix stripping.
-pub fn suggest(allocator: std.mem.Allocator, query: []const u8) std.mem.Allocator.Error![]h.Candidate {
-    if (!state.loaded) {
-        // Mark loaded first — prevents infinite retry if the file is missing.
-        state.loaded = true;
-        // TODO: scan ~/.stardict/dic/ for all subdirectories (like sdcv does) instead
-        // of hardcoding a single dictionary name. Also check /usr/share/stardict/dic/.
-        // Support ZENTO_DICT_DIR env var as an override.
-        const home = std.posix.getenv("HOME") orelse "/tmp";
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const dir = std.fmt.bufPrint(&buf,
-            "{s}/.stardict/dic/stardict-dictd-web1913-2.4.2", .{home}) catch return &.{};
-        var timer = std.time.Timer.start() catch null;
-        // page_allocator, not the caller's arena — dictionary is session-level
-        // data that must outlive arena resets between keystrokes.
-        state.dictionary = stardict.Dictionary.load(std.heap.page_allocator, dir, "dictd_www.dict.org_web1913") catch null;
-        const ms = if (timer) |*t| @as(f64, @floatFromInt(t.read())) / std.time.ns_per_ms else 0;
-        if (state.dictionary) |d| {
-            std.log.info("dictionary: {} words in {d:.1}ms", .{ d.entries.len, ms });
-        } else {
-            std.log.warn("dictionary not loaded (file missing?)", .{});
-        }
-    }
-    const d = state.dictionary orelse return &.{};
-    if (query.len == 0) return &.{};
-
-    const matches = stardict.findByPrefix(d.entries, query);
-    if (matches.len == 0) return &.{};
-
-    const count = @min(matches.len, 30);
-    var candidates = try allocator.alloc(h.Candidate, count);
-
-    for (matches[0..count], 0..) |entry, i| {
-        candidates[i] = .{
-            .label = entry.word,
-            .key = entry.word,
-        };
-    }
-
-    return candidates;
 }

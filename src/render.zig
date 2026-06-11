@@ -7,14 +7,14 @@ pub const gfx = @cImport({
 const dispatcher = @import("dispatcher.zig");
 
 const PAD_H: i32 = 16; // horizontal padding: left margin for text, right margin for sublabels
-pub const ROW_PAD: i32 = 6;  // vertical padding above and below text within each row
-pub const ICON_SIZE: i32 = 24;      // display size
-pub const ICON_MARGIN: i32 = 4;     // gap between footer separator and icon
+pub const ROW_PAD: i32 = 6; // vertical padding above and below text within each row
+pub const ICON_SIZE: i32 = 24; // display size
+pub const ICON_MARGIN: i32 = 4; // gap between footer separator and icon
 pub const BORDER: i32 = 1;
 pub const CORNER_RADIUS: i32 = 8;
 
 const icon_raw = @embedFile("assets/zento-icon.raw");
-const ICON_RAW_SIZE: i32 = 96;  // pixel size of the embedded raw file
+const ICON_RAW_SIZE: i32 = 96; // pixel size of the embedded raw file
 
 pub const DrawContext = struct {
     surface_image: *gfx.pixman_image_t,
@@ -63,12 +63,10 @@ fn drawCorners(image: *gfx.pixman_image_t, w: i32, h: i32, r: i32, bw: i32, col_
             const adx = r - dx;
             const ady = r - dy;
             const dist_sq = adx * adx + ady * ady;
-            const color = if (dist_sq > outer_sq) col_clear
-                          else if (dist_sq > inner_sq) col_border
-                          else col_bg;
-            drawRect(image, dx,         dy,         1, 1, color); // top-left
-            drawRect(image, w - 1 - dx, dy,         1, 1, color); // top-right
-            drawRect(image, dx,         h - 1 - dy, 1, 1, color); // bottom-left
+            const color = if (dist_sq > outer_sq) col_clear else if (dist_sq > inner_sq) col_border else col_bg;
+            drawRect(image, dx, dy, 1, 1, color); // top-left
+            drawRect(image, w - 1 - dx, dy, 1, 1, color); // top-right
+            drawRect(image, dx, h - 1 - dy, 1, 1, color); // bottom-left
             drawRect(image, w - 1 - dx, h - 1 - dy, 1, 1, color); // bottom-right
         }
     }
@@ -171,11 +169,11 @@ fn drawCard(ctx: DrawContext, input: []const u8, tc: dispatcher.TaggedCandidate,
     const pad_h: i32 = PAD_H * ctx.scale;
     const card_h: i32 = cardHeight(ctx);
 
-    const col_hl   = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
-    const col_white  = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
+    const col_hl = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
+    const col_white = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
     const col_prefix = gfx.pixman_color_t{ .red = 0x6666, .green = 0x6666, .blue = 0x8888, .alpha = 0xffff };
-    const col_sep    = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
-    const col_sub    = gfx.pixman_color_t{ .red = 0x7777, .green = 0x7777, .blue = 0x9999, .alpha = 0xffff };
+    const col_sep = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
+    const col_sub = gfx.pixman_color_t{ .red = 0x7777, .green = 0x7777, .blue = 0x9999, .alpha = 0xffff };
 
     drawRect(ctx.surface_image, 0, y, ctx.width, card_h, col_hl);
 
@@ -202,7 +200,6 @@ fn drawCard(ctx: DrawContext, input: []const u8, tc: dispatcher.TaggedCandidate,
         const result_baseline = y + @divTrunc(card_h - ctx.font_large.*.height, 2) + ctx.font_large.*.ascent;
         renderText(ctx.surface_image, ctx.font_large, tc.candidate.label, result_x, result_baseline, col_white);
     }
-
 }
 
 // Redraw the window: clear + layout + commit to compositor.
@@ -226,10 +223,10 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
     // Colors
     const col_bg = gfx.pixman_color_t{ .red = 0x1818, .green = 0x1818, .blue = 0x2828, .alpha = 0xffff };
     const col_hl = gfx.pixman_color_t{ .red = 0x2828, .green = 0x2828, .blue = 0x5050, .alpha = 0xffff };
-    const col_sep    = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
+    const col_sep = gfx.pixman_color_t{ .red = 0x4040, .green = 0x4040, .blue = 0x5555, .alpha = 0xffff };
     //const col_border = gfx.pixman_color_t{ .red = 0x4a4a, .green = 0x4a4a, .blue = 0x6a6a, .alpha = 0xffff };
     const col_border = gfx.pixman_color_t{ .red = 0xb4b4, .green = 0xbebe, .blue = 0xfefe, .alpha = 0xffff };
-    const col_white  = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
+    const col_white = gfx.pixman_color_t{ .red = 0xffff, .green = 0xffff, .blue = 0xffff, .alpha = 0xffff };
     const col_prefix = gfx.pixman_color_t{ .red = 0x6666, .green = 0x6666, .blue = 0x8888, .alpha = 0xffff };
     const col_sub = gfx.pixman_color_t{ .red = 0x7777, .green = 0x7777, .blue = 0x9999, .alpha = 0xffff };
 
@@ -238,9 +235,9 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
 
     // --- Border ---
     const border: i32 = BORDER * ctx.scale;
-    drawRect(ctx.surface_image, 0, 0, ctx.width, border, col_border);                   // top
+    drawRect(ctx.surface_image, 0, 0, ctx.width, border, col_border); // top
     drawRect(ctx.surface_image, 0, ctx.height - border, ctx.width, border, col_border); // bottom
-    drawRect(ctx.surface_image, 0, 0, border, ctx.height, col_border);                  // left
+    drawRect(ctx.surface_image, 0, 0, border, ctx.height, col_border); // left
     drawRect(ctx.surface_image, ctx.width - border, 0, border, ctx.height, col_border); // right
     drawCorners(ctx.surface_image, ctx.width, ctx.height, CORNER_RADIUS * ctx.scale, border, col_bg, col_border);
 
@@ -331,7 +328,7 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
         gfx.PIXMAN_a8r8g8b8,
         ICON_RAW_SIZE,
         ICON_RAW_SIZE,
-        @constCast(@ptrCast(@alignCast(icon_raw.ptr))),
+        @ptrCast(@alignCast(@constCast(icon_raw.ptr))),
         ICON_RAW_SIZE * 4,
     ) orelse return;
     defer _ = gfx.pixman_image_unref(icon_img);
@@ -356,9 +353,16 @@ pub fn redraw(ctx: DrawContext, state: RenderState) void {
 
     gfx.pixman_image_composite32(
         gfx.PIXMAN_OP_OVER,
-        icon_img, alpha_mask, ctx.surface_image,
-        0, 0, 0, 0,
-        icon_x, icon_y,
-        icon_size, icon_size,
+        icon_img,
+        alpha_mask,
+        ctx.surface_image,
+        0,
+        0,
+        0,
+        0,
+        icon_x,
+        icon_y,
+        icon_size,
+        icon_size,
     );
 }

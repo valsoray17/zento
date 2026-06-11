@@ -59,54 +59,40 @@ pub const Bus = struct {
             return error.MethodCallFailed;
         }
     }
-
 };
 
 // ============================================================================
 // Handler interface
 // ============================================================================
 
-const Entry = struct {
-    keyword: []const u8,
-    sublabel: []const u8,
-    method: []const u8,
+const candidates = [_]h.Candidate{
+    .{ .label = "Suspend", .sublabel = "Suspend the system", .aliases = &.{"Sleep"}, .key = "Suspend", .id = "Suspend" },
+    .{ .label = "Hibernate", .sublabel = "Hibernate the system", .key = "Hibernate", .id = "Hibernate" },
+    .{ .label = "Reboot", .sublabel = "Reboot the system", .aliases = &.{"Restart"}, .key = "Reboot", .id = "Reboot" },
+    .{ .label = "Shutdown", .sublabel = "Power off the system", .aliases = &.{"Turn Off"}, .key = "PowerOff", .id = "PowerOff" },
 };
 
-const entries = [_]Entry{
-    .{ .keyword = "Suspend", .sublabel = "Suspend the system", .method = "Suspend" },
-    .{ .keyword = "Hibernate", .sublabel = "Hibernate the system", .method = "Hibernate" },
-    .{ .keyword = "Reboot", .sublabel = "Reboot the system", .method = "Reboot" },
-    .{ .keyword = "Shutdown", .sublabel = "Power off the system", .method = "PowerOff" },
-};
-
-pub const handler = h.Handler{
-    .name = "systemd",
-    .kind = .cmd,
-    .on_enter = .{ .run = execute },
-    .source = .{ .load = load },
-};
-
-/// Return candidates matching input by prefix
-pub fn load(allocator: std.mem.Allocator) std.mem.Allocator.Error![]h.Candidate {
-    var candidates = try allocator.alloc(h.Candidate, entries.len);
-
-    for (entries, 0..) |entry, i| {
-        candidates[i] = .{
-            .label = entry.keyword,
-            .sublabel = entry.sublabel,
-            .key = entry.method,
-            .id = entry.keyword,
-        };
+pub const Systemd = struct {
+    /// Return candidates matching input by prefix
+    pub fn load(_: *Systemd, _: std.Io) anyerror![]const h.Candidate {
+        return &candidates;
     }
 
-    return candidates;
-}
+    /// Execute a systemd command using the candidate's action (D-Bus method name)
+    pub fn execute(_: *Systemd, _: std.Io, key: []const u8) anyerror!void {
+        var bus = try Bus.connectSystem();
+        defer bus.disconnect();
 
-/// Execute a systemd command using the candidate's action (D-Bus method name)
-pub fn execute(key: []const u8) anyerror!void {
-    var bus = try Bus.connectSystem();
-    defer bus.disconnect();
+        try bus.callLogin1Method(key);
+    }
 
-    try bus.callLogin1Method(key);
-}
-
+    pub fn handler(self: *Systemd) h.Handler {
+        return .{
+            .ptr = self,
+            .name = "systemd",
+            .kind = .cmd,
+            .on_enter = .{ .run = h.executeFn(Systemd) },
+            .source = .{ .load = h.loadFn(Systemd) },
+        };
+    }
+};

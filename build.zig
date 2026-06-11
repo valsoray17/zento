@@ -40,12 +40,12 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("wayland", wayland);
 
     // Link system libraries
-    exe.linkLibC();
-    exe.linkSystemLibrary("libsystemd");
-    exe.linkSystemLibrary("wayland-client");
-    exe.linkSystemLibrary("pixman-1");
-    exe.linkSystemLibrary("fcft");
-    exe.linkSystemLibrary("xkbcommon");
+    exe.root_module.link_libc = true;
+    exe.root_module.linkSystemLibrary("libsystemd", .{});
+    exe.root_module.linkSystemLibrary("wayland-client", .{});
+    exe.root_module.linkSystemLibrary("pixman-1", .{});
+    exe.root_module.linkSystemLibrary("fcft", .{});
+    exe.root_module.linkSystemLibrary("xkbcommon", .{});
 
     b.installArtifact(exe);
 

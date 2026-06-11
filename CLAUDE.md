@@ -4,6 +4,12 @@
 Learning Zig by building a Raycast-like launcher application.
 Background: Coming from Go.
 
+## Zig Version
+This project uses Zig 0.16.0. Key API notes:
+- Use the new Writer interface (not the old bufferedWriter API)
+- Be aware of arena lifetime and managed ArrayList changes
+- Verify Zig stdlib APIs against current docs before suggesting them
+
 ## Development Approach
 - Always implement changes step-by-step, one piece at a time. Never implement everything at once. Wait for confirmation before moving to the next step.
 - When the user asks to build something incrementally, treat each logical unit as a separate step with its own review cycle.

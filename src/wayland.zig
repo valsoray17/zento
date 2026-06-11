@@ -13,6 +13,13 @@ const xkb = @cImport(@cInclude("xkbcommon/xkbcommon.h"));
 const WIDTH = 600;
 const HEIGHT = 400;
 
+// Environment values, read once in main and passed in (env is non-global in 0.16).
+pub const Env = struct {
+    home: ?[]const u8,
+    data_dirs: ?[]const u8,
+    cache_home: ?[]const u8,
+};
+
 // Input state
 // Text input buffer — accumulates keypresses as UTF-8 bytes.
 // cursor is a byte offset into input_buf (not a codepoint index).
@@ -69,6 +76,7 @@ const App = struct {
     input: InputState = .{},
 
     dispatch: ?dispatcher.DispatcherState = null,
+    io: std.Io = undefined,
 
     scale: i32 = 1,
     font: ?*gfx.struct_fcft_font = null,
@@ -81,8 +89,9 @@ const App = struct {
     visible_rows: usize = 0,
 };
 
-pub fn run() !void {
+pub fn run(io: std.Io, env: Env) !void {
     var app = App{};
+    app.io = io;
 
     // fcft_init: sets up fontconfig, freetype, logging.
     // Must be called before any other fcft function.
@@ -227,17 +236,21 @@ pub fn run() !void {
     const size: usize = @intCast(stride * physical_h);
 
     const fd = try std.posix.memfd_create("zento-shm", 0);
-    defer std.posix.close(fd);
+    defer _ = std.posix.system.close(fd);
 
     // Set the file size — starts at 0 bytes by default
-    try std.posix.ftruncate(fd, @intCast(size));
+    // TODO there's a recommendation to go higher with std.Io
+    switch (std.posix.errno(std.posix.system.ftruncate(fd, @intCast(size)))) {
+        .SUCCESS => {},
+        else => return error.Truncate,
+    }
 
     // Map into our address space: we get a []u8 slice over WIDTH*HEIGHT*4 bytes.
     // SHARED: writes are visible to other mmaps of the same fd (i.e. the compositor).
     const data = try std.posix.mmap(
         null,
         size,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        std.posix.PROT{ .READ = true, .WRITE = true },
         .{ .TYPE = .SHARED },
         fd,
         0,
@@ -288,17 +301,25 @@ pub fn run() !void {
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
-    history.load();
-    app.dispatch = dispatcher.DispatcherState{ .arena = &arena };
-    dispatcher.loadMode(&app.dispatch.?, &dispatcher.default_mode);
-    dispatcher.run(&app.dispatch.?, app.input.buf[0..app.input.len]);
+    // Handler instances + modes live here for the whole session
+    var handler_arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer handler_arena.deinit();
+    history.load(io, env.home, env.cache_home);
+    app.dispatch = try dispatcher.DispatcherState.init(
+        handler_arena.allocator(),
+        &arena,
+        io,
+        env.home,
+        env.data_dirs,
+    );
+    dispatcher.run(&app.dispatch.?, io, app.input.buf[0..app.input.len]);
     redraw(&app);
 
     std.debug.print("Window open. Press Escape to close.\n", .{});
     while (app.running) {
         if (display.dispatch() != .SUCCESS) break;
     }
-    history.save();
+    history.save(io, env.home, env.cache_home);
 }
 
 fn redraw(app: *App) void {
@@ -373,12 +394,12 @@ fn keyboardListener(_: *wl.Keyboard, event: wl.Keyboard.Event, app: *App) void {
             // It arrives as a file descriptor containing an XKB text-format string.
             // We mmap it to read the string, then hand it to xkbcommon.
             if (ev.format != .xkb_v1) return;
-            defer std.posix.close(ev.fd);
+            defer _ = std.posix.system.close(ev.fd);
 
             const map_str = std.posix.mmap(
                 null,
                 ev.size,
-                std.posix.PROT.READ,
+                std.posix.PROT{ .READ = true },
                 .{ .TYPE = .PRIVATE },
                 ev.fd,
                 0,
@@ -442,16 +463,16 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             std.heap.page_allocator.free(app.expanded.?);
             app.expanded = null;
             redraw(app);
-        } else if (d.mode == &dispatcher.default_mode) {
+        } else if (d.mode == &d.modes.default) {
             // in default mode, close the app
             app.running = false;
         } else {
             // we are one level into another mode
-            dispatcher.loadMode(d, &dispatcher.default_mode);
+            dispatcher.loadMode(d, app.io, .default);
             app.input = .{};
             app.selected = 0;
             app.scroll_offset = 0;
-            dispatcher.run(d, app.input.buf[0..app.input.len]);
+            dispatcher.run(d, app.io, app.input.buf[0..app.input.len]);
             redraw(app);
         }
         return;
@@ -476,7 +497,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                 app.input.cursor = start;
                 app.selected = 0;
                 app.scroll_offset = 0;
-                dispatcher.run(d, app.input.buf[0..app.input.len]);
+                dispatcher.run(d, app.io, app.input.buf[0..app.input.len]);
                 redraw(app);
             }
         },
@@ -490,7 +511,7 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
                 app.input.len -= removed;
                 app.selected = 0;
                 app.scroll_offset = 0;
-                dispatcher.run(d, app.input.buf[0..app.input.len]);
+                dispatcher.run(d, app.io, app.input.buf[0..app.input.len]);
                 redraw(app);
             }
         },
@@ -545,12 +566,12 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             switch (tc.handler.on_enter) {
                 .close => app.running = false,
                 .run => |exec| {
-                    exec(tc.candidate.key orelse return) catch |err|
+                    exec(tc.handler.ptr, app.io, tc.candidate.key orelse return) catch |err|
                         std.debug.print("error: {}\n", .{err});
                     app.running = false;
                 },
                 .show => |expand| {
-                    const text = expand(std.heap.page_allocator, tc.candidate.key orelse return) catch return;
+                    const text = expand(tc.handler.ptr, app.io, std.heap.page_allocator, tc.candidate.key orelse return) catch return;
                     if (app.expanded) |old| std.heap.page_allocator.free(old);
                     app.expanded = text;
                     app.expanded_scroll = 0;
@@ -588,17 +609,17 @@ fn handleKey(app: *App, key: u32, state: wl.Keyboard.KeyState) void {
             app.input.cursor += n;
 
             // TODO improve this. This is a dictionary mode
-            if (d.mode == &dispatcher.default_mode and
+            if (d.mode == &d.modes.default and
                 std.mem.eql(u8, app.input.buf[0..app.input.len], "dw "))
             {
-                dispatcher.loadMode(d, &dispatcher.dict_mode);
+                dispatcher.loadMode(d, app.io, .dict);
                 // TODO should we handle this in loadMode too?
                 app.input = .{};
             }
 
             app.selected = 0;
             app.scroll_offset = 0;
-            dispatcher.run(d, app.input.buf[0..app.input.len]);
+            dispatcher.run(d, app.io, app.input.buf[0..app.input.len]);
             redraw(app);
         },
     }
